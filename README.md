@@ -21,9 +21,15 @@ Shift+CapsLock for regular Caps Lock. Single-file tray app, no dependencies.*
 - Маніфест `requireAdministrator`: без нього UIPI блокує повідомлення у бік
   elevated-вікон (адмінський термінал, regedit) — Caps ковтався б, а розкладка
   не перемикалась. Наслідок: ручний запуск — через UAC-промпт.
-- Автозапуск (чекбокс у вікні) = задача Task Scheduler **`capslang`**
-  (`ONLOGON`, `RL HIGHEST`) — стартує elevated БЕЗ UAC-промпта. Run-ключ реєстру
-  для elevated-програм не працює, тому саме задача.
+- Автозапуск (чекбокс у вікні) = задача Task Scheduler **`capslang`** (тригер
+  «вхід у систему», RunLevel HIGHEST) — стартує elevated БЕЗ UAC-промпта.
+  Run-ключ реєстру для elevated-програм не працює, тому саме задача.
+  Створюється через COM API планувальника, а не запуском `schtasks.exe`:
+  дочірній процес, що прописує задачу з найвищими правами, — типовий
+  персистенс-патерн малварі, на який реагують евристики антивірусів.
+  Заразом COM дозволяє виправити шкідливі для фонового застосунку дефолти
+  планувальника: не блокувати старт на батареї й не вбивати процес через
+  3 доби роботи (`ExecutionTimeLimit`).
 
 ## Використання
 
@@ -49,15 +55,33 @@ exe і кладе його в артефакти прогону, релізу н
 Exe не підписаний, тож при першому запуску Windows SmartScreen покаже
 попередження («More info» → «Run anyway»).
 
+### Хибні спрацьовки антивірусів
+
+Непідписаний бінарник із нульовою репутацією, який просить права
+адміністратора, перехоплює глобальну клавішу і прописує собі автозапуск,
+для ML-евристик виглядає як кейлогер із персистенцією — Defender ловив
+v1.0.0 як `Trojan:Win32/Wacatac.B!ml` (типове «сміттєве відро» хибних
+спрацьовків). Що зроблено, щоб профіль файлу не виглядав анонімним:
+
+- метадані VERSIONINFO (продукт, версія, автор, копірайт);
+- збірка релізів через MSVC, а не MinGW;
+- автозапуск через COM API планувальника замість запуску `schtasks.exe`.
+
+Радикально питання закриває лише підпис коду сертифікатом. Якщо детект
+повторюється — його варто подати як хибний на
+[Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission).
+
 ## Збірка локально
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-Потрібен лише LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`) —
-`build.ps1` сам знаходить toolchain у winget-пакеті. Результат: один
-самодостатній `capslang.exe` (~300 КБ, статичний лінк, без зовнішніх DLL).
+`build.ps1` бере MSVC, якщо знаходить його через `vswhere`, інакше відкочується
+на mingw-w64 (`g++`/`windres` з PATH або LLVM-MinGW із winget:
+`winget install MartinStorsjo.LLVM-MinGW.UCRT`). Примусово — `-Toolchain msvc`
+чи `-Toolchain mingw`. Результат в обох випадках — один самодостатній
+`capslang.exe` (~300 КБ, статичний CRT, без зовнішніх DLL).
 
 ## Файли
 
@@ -65,8 +89,8 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 |---|---|
 | `capslang.cpp` | весь код утиліти |
 | `capslang.manifest` | requireAdministrator + dpiAware + visual styles |
-| `capslang.rc` | іконка, маніфест і PNG-логотип у ресурси exe |
-| `build.ps1` | збірка (windres + clang++, статичний лінк) |
+| `capslang.rc` | іконка, маніфест, PNG-логотип і VERSIONINFO у ресурси exe |
+| `build.ps1` | збірка: MSVC, з відкотом на mingw-w64 |
 | `capslang.ico` | іконка exe і трею |
 | `capslang.png` | той самий логотип; вшивається в exe і малюється у вікні (GDI+) |
 | `screenshot.png` | вигляд вікна налаштувань |

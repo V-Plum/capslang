@@ -1,10 +1,62 @@
 # Build script for capslang (ASCII only - no BOM issues).
-# Toolchain: any mingw-w64 g++ + windres. Locally that is LLVM-MinGW installed
-# via winget (MartinStorsjo.LLVM-MinGW.UCRT); on CI it comes from PATH.
+#
+# Prefers MSVC (that is what CI releases are built with: MinGW-built binaries
+# trip antivirus ML heuristics far more often). Falls back to a mingw-w64
+# toolchain - g++/windres from PATH, or LLVM-MinGW installed via winget - so
+# the project still builds on machines without Visual Studio.
+#
+# Force one or the other with -Toolchain msvc|mingw.
+param(
+    [ValidateSet("auto", "msvc", "mingw")]
+    [string]$Toolchain = "auto"
+)
+
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-function Resolve-Tool([string]$name) {
+$LIBS = @(
+    "user32.lib", "gdi32.lib", "shell32.lib", "comctl32.lib",
+    "shlwapi.lib", "ole32.lib", "oleaut32.lib", "gdiplus.lib", "taskschd.lib"
+)
+
+function Find-VcVars {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+    if (-not (Test-Path $vswhere)) { return $null }
+    $install = & $vswhere -latest -products * `
+        -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+        -property installationPath 2>$null
+    if (-not $install) { return $null }
+    $vcvars = Join-Path $install "VC\Auxiliary\Build\vcvars64.bat"
+    if (Test-Path $vcvars) { return $vcvars }
+    return $null
+}
+
+# vcvars64.bat only sets variables in its own cmd session; import them here.
+function Import-VcEnv([string]$vcvars) {
+    cmd /c "`"$vcvars`" >nul 2>&1 && set" | ForEach-Object {
+        if ($_ -match '^([^=]+)=(.*)$') {
+            Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+        }
+    }
+}
+
+function Build-Msvc([string]$vcvars) {
+    Import-VcEnv $vcvars
+
+    & rc.exe /nologo /fo capslang.res capslang.rc
+    if ($LASTEXITCODE -ne 0) { throw "rc.exe failed" }
+
+    # /MT: static CRT, no VC++ redistributable needed on the target machine.
+    & cl.exe /nologo /std:c++17 /W3 /O2 /MT /DNDEBUG /DUNICODE /D_UNICODE `
+        capslang.cpp capslang.res `
+        /link /SUBSYSTEM:WINDOWS /OUT:capslang.exe $LIBS
+    if ($LASTEXITCODE -ne 0) { throw "cl.exe failed" }
+
+    Remove-Item capslang.obj, capslang.res -ErrorAction SilentlyContinue
+    Write-Host "OK: capslang.exe built with MSVC"
+}
+
+function Resolve-MingwTool([string]$name) {
     $inPath = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue |
         Select-Object -First 1
     if ($inPath) { return $inPath.Source }
@@ -19,17 +71,30 @@ function Resolve-Tool([string]$name) {
     throw "$name not found. Install a mingw-w64 toolchain, e.g. winget install MartinStorsjo.LLVM-MinGW.UCRT"
 }
 
-$windres = Resolve-Tool "windres"
-$gxx     = Resolve-Tool "g++"
+function Build-Mingw {
+    $windres = Resolve-MingwTool "windres"
+    $gxx     = Resolve-MingwTool "g++"
 
-& $windres -i capslang.rc -o capslang_res.o
-if ($LASTEXITCODE -ne 0) { throw "windres failed" }
+    & $windres -i capslang.rc -o capslang_res.o
+    if ($LASTEXITCODE -ne 0) { throw "windres failed" }
 
-# -fno-exceptions/-fno-rtti: GDI++ wrapper uses status codes, not throws;
-# drops ~240 KB of static C++ runtime from the exe.
-& $gxx capslang.cpp capslang_res.o -o capslang.exe `
-    -municode -mwindows -O2 -s -static -fno-exceptions -fno-rtti `
-    -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -lcomctl32
-if ($LASTEXITCODE -ne 0) { throw "compile failed" }
+    # -fno-exceptions/-fno-rtti: GDI+ and the Task Scheduler COM API report
+    # status codes rather than throwing; this drops ~240 KB of C++ runtime.
+    & $gxx capslang.cpp capslang_res.o -o capslang.exe `
+        -municode -mwindows -O2 -s -static -fno-exceptions -fno-rtti `
+        -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -loleaut32 -lcomctl32 -ltaskschd -luuid
+    if ($LASTEXITCODE -ne 0) { throw "compile failed" }
 
-Write-Host "OK: capslang.exe built"
+    Remove-Item capslang_res.o -ErrorAction SilentlyContinue
+    Write-Host "OK: capslang.exe built with mingw-w64"
+}
+
+$vcvars = if ($Toolchain -eq "mingw") { $null } else { Find-VcVars }
+
+if ($vcvars) {
+    Build-Msvc $vcvars
+} elseif ($Toolchain -eq "msvc") {
+    throw "MSVC requested but Visual Studio C++ tools were not found"
+} else {
+    Build-Mingw
+}

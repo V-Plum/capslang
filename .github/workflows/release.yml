@@ -17,11 +17,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Add mingw-w64 toolchain to PATH
-        run: Add-Content $env:GITHUB_PATH "C:\msys64\mingw64\bin"
-
+      # MSVC is preinstalled on windows-latest; build.ps1 locates it via
+      # vswhere. Release binaries are deliberately MSVC-built - MinGW output
+      # trips antivirus ML heuristics far more often.
       - name: Build
-        run: powershell -ExecutionPolicy Bypass -File build.ps1
+        run: powershell -ExecutionPolicy Bypass -File build.ps1 -Toolchain msvc
+
+      - name: Show binary metadata
+        run: |
+          $exe = Get-Item capslang.exe
+          "size: $($exe.Length) bytes"
+          $exe.VersionInfo | Format-List ProductName, FileVersion, CompanyName, LegalCopyright
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7

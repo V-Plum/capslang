@@ -23,6 +23,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <commctrl.h>
+#include <taskschd.h>
 #include <gdiplus.h>
 
 namespace {
@@ -89,44 +90,160 @@ void SwitchLayout()
         ActivateKeyboardLayout(next, 0);
 }
 
-// ---------- автозапуск (Task Scheduler) ----------
+// ---------- автозапуск (Task Scheduler через COM) ----------
+//
+// Свідомо НЕ через запуск schtasks.exe: породження дочірнього процесу, який
+// створює задачу з найвищими правами, — типовий персистенс-патерн малварі, і
+// ML-евристики антивірусів на нього реагують. COM-шлях робить те саме напряму.
 
-DWORD RunHidden(wchar_t* cmdline)
+// Підключення до планувальника; при true — звільнити обидва вказівники.
+bool OpenTaskRoot(ITaskService** svcOut, ITaskFolder** rootOut)
 {
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = {};
-    if (!CreateProcessW(nullptr, cmdline, nullptr, nullptr, FALSE,
-                        CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi))
-        return (DWORD)-1;
-    WaitForSingleObject(pi.hProcess, 15000);
-    DWORD code = (DWORD)-1;
-    GetExitCodeProcess(pi.hProcess, &code);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return code;
+    *svcOut = nullptr;
+    *rootOut = nullptr;
+
+    ITaskService* svc = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_TaskScheduler, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_ITaskService, (void**)&svc)))
+        return false;
+
+    VARIANT empty;
+    VariantInit(&empty);
+    if (FAILED(svc->Connect(empty, empty, empty, empty))) {
+        svc->Release();
+        return false;
+    }
+
+    ITaskFolder* root = nullptr;
+    BSTR path = SysAllocString(L"\\");
+    HRESULT hr = svc->GetFolder(path, &root);
+    SysFreeString(path);
+    if (FAILED(hr)) {
+        svc->Release();
+        return false;
+    }
+
+    *svcOut = svc;
+    *rootOut = root;
+    return true;
 }
 
 bool AutostartEnabled()
 {
-    wchar_t cmd[256];
-    wsprintfW(cmd, L"schtasks /Query /TN \"%s\"", kTaskName);
-    return RunHidden(cmd) == 0;
+    ITaskService* svc;
+    ITaskFolder* root;
+    if (!OpenTaskRoot(&svc, &root)) return false;
+
+    IRegisteredTask* task = nullptr;
+    BSTR name = SysAllocString(kTaskName);
+    bool found = SUCCEEDED(root->GetTask(name, &task)) && task;
+    SysFreeString(name);
+
+    if (task) task->Release();
+    root->Release();
+    svc->Release();
+    return found;
+}
+
+void FillTaskDefinition(ITaskDefinition* def)
+{
+    IRegistrationInfo* info = nullptr;
+    if (SUCCEEDED(def->get_RegistrationInfo(&info)) && info) {
+        BSTR s = SysAllocString(L"capslang — CapsLock перемикає розкладку клавіатури");
+        info->put_Description(s);
+        SysFreeString(s);
+        info->Release();
+    }
+
+    // Найвищі права: без них перемикання не діє в elevated-вікнах (UIPI)
+    IPrincipal* principal = nullptr;
+    if (SUCCEEDED(def->get_Principal(&principal)) && principal) {
+        principal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+        principal->put_LogonType(TASK_LOGON_INTERACTIVE_TOKEN);
+        principal->Release();
+    }
+
+    // Дефолти планувальника розраховані на разові задачі й фоновому застосунку
+    // шкідливі: на батареї він би не стартував, а через 3 доби безперервної
+    // роботи його вбило б по ExecutionTimeLimit.
+    ITaskSettings* settings = nullptr;
+    if (SUCCEEDED(def->get_Settings(&settings)) && settings) {
+        settings->put_DisallowStartIfOnBatteries(VARIANT_FALSE);
+        settings->put_StopIfGoingOnBatteries(VARIANT_FALSE);
+        BSTR noLimit = SysAllocString(L"PT0S");
+        settings->put_ExecutionTimeLimit(noLimit);
+        SysFreeString(noLimit);
+        settings->put_MultipleInstances(TASK_INSTANCES_IGNORE_NEW);
+        settings->put_StartWhenAvailable(VARIANT_TRUE);
+        settings->put_Enabled(VARIANT_TRUE);
+
+        IIdleSettings* idle = nullptr;
+        if (SUCCEEDED(settings->get_IdleSettings(&idle)) && idle) {
+            idle->put_StopOnIdleEnd(VARIANT_FALSE);
+            idle->Release();
+        }
+        settings->Release();
+    }
+
+    ITriggerCollection* triggers = nullptr;
+    if (SUCCEEDED(def->get_Triggers(&triggers)) && triggers) {
+        ITrigger* trigger = nullptr;
+        if (SUCCEEDED(triggers->Create(TASK_TRIGGER_LOGON, &trigger)) && trigger)
+            trigger->Release();
+        triggers->Release();
+    }
+
+    IActionCollection* actions = nullptr;
+    if (SUCCEEDED(def->get_Actions(&actions)) && actions) {
+        IAction* action = nullptr;
+        if (SUCCEEDED(actions->Create(TASK_ACTION_EXEC, &action)) && action) {
+            IExecAction* exec = nullptr;
+            if (SUCCEEDED(action->QueryInterface(IID_IExecAction, (void**)&exec)) && exec) {
+                wchar_t exePath[MAX_PATH];
+                GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+                BSTR p = SysAllocString(exePath);
+                exec->put_Path(p);
+                SysFreeString(p);
+                exec->Release();
+            }
+            action->Release();
+        }
+        actions->Release();
+    }
 }
 
 bool SetAutostart(bool enable)
 {
-    wchar_t cmd[1024];
-    if (enable) {
-        wchar_t exe[MAX_PATH];
-        GetModuleFileNameW(nullptr, exe, MAX_PATH);
-        wsprintfW(cmd,
-            L"schtasks /Create /F /TN \"%s\" /TR \"\\\"%s\\\"\" /SC ONLOGON /RL HIGHEST",
-            kTaskName, exe);
+    ITaskService* svc;
+    ITaskFolder* root;
+    if (!OpenTaskRoot(&svc, &root)) return false;
+
+    BSTR name = SysAllocString(kTaskName);
+    bool ok = false;
+
+    if (!enable) {
+        HRESULT hr = root->DeleteTask(name, 0);
+        ok = SUCCEEDED(hr) || hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
     } else {
-        wsprintfW(cmd, L"schtasks /Delete /F /TN \"%s\"", kTaskName);
+        ITaskDefinition* def = nullptr;
+        if (SUCCEEDED(svc->NewTask(0, &def)) && def) {
+            FillTaskDefinition(def);
+
+            VARIANT empty;
+            VariantInit(&empty);
+            IRegisteredTask* registered = nullptr;
+            ok = SUCCEEDED(root->RegisterTaskDefinition(
+                name, def, TASK_CREATE_OR_UPDATE,
+                empty, empty, TASK_LOGON_INTERACTIVE_TOKEN, empty, &registered));
+            if (registered) registered->Release();
+            def->Release();
+        }
     }
-    RunHidden(cmd);
-    return AutostartEnabled() == enable;
+
+    SysFreeString(name);
+    root->Release();
+    svc->Release();
+    return ok;
 }
 
 // ---------- GUI ----------
@@ -281,6 +398,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
+    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
 
@@ -358,5 +477,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     UnregisterHotKey(hwnd, HOTKEY_ID);
     delete g_logo;
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
+    CoUninitialize();
     return 0;
 }
