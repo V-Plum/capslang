@@ -12,13 +12,14 @@ if (-not $bin -or -not (Test-Path "$bin\g++.exe")) { throw "LLVM-MinGW not found
 $windres = Join-Path $bin "windres.exe"
 $gxx     = Join-Path $bin "g++.exe"
 
-if (-not (Test-Path "capslang.ico")) { python make_icon.py }
-
 & $windres -i capslang.rc -o capslang_res.o
 if ($LASTEXITCODE -ne 0) { throw "windres failed" }
 
+# -fno-exceptions/-fno-rtti: GDI++ wrapper uses status codes, not throws;
+# drops ~240 KB of static C++ runtime from the exe.
 & $gxx capslang.cpp capslang_res.o -o capslang.exe `
-    -municode -mwindows -O2 -s -static -lshell32 -lgdi32
+    -municode -mwindows -O2 -s -static -fno-exceptions -fno-rtti `
+    -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -lcomctl32
 if ($LASTEXITCODE -ne 0) { throw "compile failed" }
 
 Write-Host "OK: capslang.exe built"

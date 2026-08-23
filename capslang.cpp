@@ -21,6 +21,9 @@
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
 #include <shellapi.h>
+#include <shlwapi.h>
+#include <commctrl.h>
+#include <gdiplus.h>
 
 namespace {
 
@@ -28,6 +31,8 @@ constexpr UINT WMAPP_TRAY         = WM_APP + 1;
 constexpr UINT WMAPP_SHOWSETTINGS = WM_APP + 2;
 constexpr int  HOTKEY_ID     = 1;
 constexpr int  IDC_AUTOSTART = 100;
+constexpr int  IDC_COPYRIGHT = 101;
+constexpr int  IDR_LOGO_PNG  = 100;  // RCDATA з capslang.png
 constexpr UINT IDM_SETTINGS  = 1;
 constexpr UINT IDM_EXIT      = 2;
 
@@ -37,6 +42,10 @@ const wchar_t* kTaskName = L"capslang";
 NOTIFYICONDATAW g_nid = {};
 HWND g_checkbox = nullptr;
 UINT g_taskbarCreatedMsg = 0;
+
+ULONG_PTR g_gdiplusToken = 0;
+Gdiplus::Image* g_logo = nullptr;
+RECT g_logoRect = {};  // куди малювати логотип (пікселі клієнтської області)
 
 // ---------- перемикання розкладки ----------
 
@@ -122,6 +131,41 @@ bool SetAutostart(bool enable)
 
 // ---------- GUI ----------
 
+// PNG-логотип із ресурсів (GDI+ малює його з альфа-каналом поверх фону вікна)
+void LoadLogo(HINSTANCE hInst)
+{
+    HRSRC res = FindResourceW(hInst, MAKEINTRESOURCEW(IDR_LOGO_PNG), RT_RCDATA);
+    if (!res) return;
+    HGLOBAL blob = LoadResource(hInst, res);
+    void* data = LockResource(blob);
+    DWORD size = SizeofResource(hInst, res);
+    if (!data || !size) return;
+
+    if (IStream* stream = SHCreateMemStream((const BYTE*)data, size)) {
+        g_logo = Gdiplus::Image::FromStream(stream);
+        stream->Release();
+        if (g_logo && g_logo->GetLastStatus() != Gdiplus::Ok) {
+            delete g_logo;
+            g_logo = nullptr;
+        }
+    }
+}
+
+void PaintWindow(HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(hwnd, &ps);
+    if (g_logo) {
+        Gdiplus::Graphics g(dc);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.SetPixelOffsetMode(Gdiplus::PixelOffsetModeHighQuality);
+        g.DrawImage(g_logo, (INT)g_logoRect.left, (INT)g_logoRect.top,
+                    (INT)(g_logoRect.right - g_logoRect.left),
+                    (INT)(g_logoRect.bottom - g_logoRect.top));
+    }
+    EndPaint(hwnd, &ps);
+}
+
 void ShowSettings(HWND hwnd)
 {
     SendMessageW(g_checkbox, BM_SETCHECK,
@@ -194,8 +238,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
 
+    case WM_PAINT:
+        PaintWindow(hwnd);
+        return 0;
+
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wp, TRANSPARENT);
+        if (GetDlgCtrlID((HWND)lp) == IDC_COPYRIGHT)
+            SetTextColor((HDC)wp, GetSysColor(COLOR_GRAYTEXT));
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 
     case WM_CLOSE:
@@ -231,6 +281,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     g_taskbarCreatedMsg = RegisterWindowMessageW(L"TaskbarCreated");
 
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+
+    Gdiplus::GdiplusStartupInput gdipInput;
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdipInput, nullptr);
+    LoadLogo(hInst);
+
     const UINT dpi = GetDpiForSystem();
     auto sc = [dpi](int v) { return MulDiv(v, (int)dpi, 96); };
 
@@ -243,7 +300,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    const int w = sc(400), h = sc(140);
+    const int w = sc(440), h = sc(176);
     RECT rc = { 0, 0, w, h };
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU, FALSE);
     HWND hwnd = CreateWindowW(kWndClass, L"capslang", WS_CAPTION | WS_SYSMENU,
@@ -261,10 +318,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
         return c;
     };
-    mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 20, 16, 360, 20, 0);
-    mk(L"STATIC", L"Shift + CapsLock — звичайний Caps Lock", 0, 20, 40, 360, 20, 0);
+    mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 20, 18, 296, 20, 0);
+    mk(L"STATIC", L"Shift + CapsLock — звичайний Caps Lock", 0, 20, 42, 296, 20, 0);
     g_checkbox = mk(L"BUTTON", L"Запускати при вході в Windows",
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 20, 80, 360, 24, IDC_AUTOSTART);
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 20, 86, 296, 24, IDC_AUTOSTART);
+    mk(L"STATIC", L"© Plum, 2026", 0, 20, 142, 200, 18, IDC_COPYRIGHT);
+
+    // Логотип праворуч від налаштувань
+    SetRect(&g_logoRect, sc(336), sc(30), sc(336 + 84), sc(30 + 84));
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd   = hwnd;
@@ -295,5 +356,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
 
     UnregisterHotKey(hwnd, HOTKEY_ID);
+    delete g_logo;
+    Gdiplus::GdiplusShutdown(g_gdiplusToken);
     return 0;
 }

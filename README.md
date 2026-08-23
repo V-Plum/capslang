@@ -1,12 +1,14 @@
 # capslang
 
-<img src="preview.png" width="128" align="right" alt="capslang icon">
+<img src="capslang.png" width="128" align="right" alt="capslang icon">
 
 Перемикання розкладки клавіатури по **CapsLock** для Windows 11.
 **Shift + CapsLock** — звичайний Caps Lock.
 
 *Keyboard layout switcher for Windows 11: tap CapsLock to switch layouts,
-Shift+CapsLock for regular Caps Lock. Tray app, ~50 KB, no dependencies.*
+Shift+CapsLock for regular Caps Lock. Single-file tray app, no dependencies.*
+
+![Вікно налаштувань](screenshot.png)
 
 ## Механізм
 
@@ -36,20 +38,21 @@ Shift+CapsLock for regular Caps Lock. Tray app, ~50 KB, no dependencies.*
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
-Потрібно: Python + Pillow (генерація іконки, `make_icon.py`) і LLVM-MinGW
-(`winget install MartinStorsjo.LLVM-MinGW.UCRT`). `build.ps1` сам знаходить
-toolchain у winget-пакеті.
+Потрібен лише LLVM-MinGW (`winget install MartinStorsjo.LLVM-MinGW.UCRT`) —
+`build.ps1` сам знаходить toolchain у winget-пакеті. Результат: один
+самодостатній `capslang.exe` (~300 КБ, статичний лінк, без зовнішніх DLL).
 
 ## Файли
 
 | Файл | Що це |
 |---|---|
 | `capslang.cpp` | весь код утиліти |
-| `capslang.manifest` | requireAdministrator + dpiAware |
-| `capslang.rc` | іконка + маніфест у ресурси exe |
-| `make_icon.py` | генератор `capslang.ico` (Q ⇄ Ї) |
+| `capslang.manifest` | requireAdministrator + dpiAware + visual styles |
+| `capslang.rc` | іконка, маніфест і PNG-логотип у ресурси exe |
 | `build.ps1` | збірка (windres + clang++, статичний лінк) |
-| `preview.png` | прев'ю іконки (генерується разом з .ico) |
+| `capslang.ico` | іконка exe і трею |
+| `capslang.png` | той самий логотип; вшивається в exe і малюється у вікні (GDI+) |
+| `screenshot.png` | вигляд вікна налаштувань |
 
 ## Відомі обмеження
 
@@ -58,3 +61,6 @@ toolchain у winget-пакеті.
 - Задача автозапуску тригериться на логон будь-якого користувача машини
   (стандартна поведінка `schtasks /SC ONLOGON`); на однокористувацькій
   машині неважливо.
+- `capslang.ico` містить один розмір (128×128) — для трею Windows масштабує
+  його сам. Якщо іконка в треї здається м'якою, у .ico варто додати кадри
+  16/24/32/48.
