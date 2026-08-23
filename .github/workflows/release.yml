@@ -29,6 +29,19 @@ jobs:
           "size: $($exe.Length) bytes"
           $exe.VersionInfo | Format-List ProductName, FileVersion, CompanyName, LegalCopyright
 
+      # The UI strings are Cyrillic and the source is UTF-8 without a BOM, so a
+      # compiler that assumes the ANSI codepage silently produces mojibake that
+      # only shows up when the window is opened. Check the literal is intact.
+      # Built from code points so this file itself stays ASCII.
+      - name: UI strings must not be mangled
+        run: |
+          $want = -join (0x0417,0x0430,0x043F,0x0443,0x0441,0x043A,0x0430,0x0442,0x0438 |
+                         ForEach-Object { [char]$_ })   # "Zapuskaty" in Cyrillic
+          $bytes = [IO.File]::ReadAllBytes("capslang.exe")
+          $utf16 = [Text.Encoding]::Unicode.GetString($bytes)
+          if ($utf16 -notlike "*$want*") { throw "Cyrillic UI strings are mangled - is /utf-8 set?" }
+          "UI strings ok"
+
       # Catches the easy mistake of tagging a release without bumping the
       # version in capslang.rc - the release then ships mislabelled.
       - name: Version must match the tag

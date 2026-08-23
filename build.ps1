@@ -46,8 +46,10 @@ function Build-Msvc([string]$vcvars) {
     & rc.exe /nologo /fo capslang.res capslang.rc
     if ($LASTEXITCODE -ne 0) { throw "rc.exe failed" }
 
+    # /utf-8: the source is UTF-8 without a BOM, and cl.exe would otherwise
+    # read it in the system ANSI codepage and mangle every Cyrillic literal.
     # /MT: static CRT, no VC++ redistributable needed on the target machine.
-    & cl.exe /nologo /std:c++17 /W3 /O2 /MT /DNDEBUG /DUNICODE /D_UNICODE `
+    & cl.exe /nologo /std:c++17 /utf-8 /W3 /O2 /MT /DNDEBUG /DUNICODE /D_UNICODE `
         capslang.cpp capslang.res `
         /link /SUBSYSTEM:WINDOWS /OUT:capslang.exe $LIBS
     if ($LASTEXITCODE -ne 0) { throw "cl.exe failed" }
