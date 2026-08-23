@@ -71,6 +71,22 @@ v1.0.0 як `Trojan:Win32/Wacatac.B!ml` (типове «сміттєве від�
 повторюється — його варто подати як хибний на
 [Microsoft Security Intelligence](https://www.microsoft.com/en-us/wdsi/filesubmission).
 
+## Іконка
+
+Майстер-файл — `capslang.svg`. Після його правки:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File make_icon.ps1   # SVG -> ico + png
+powershell -ExecutionPolicy Bypass -File build.ps1       # перезібрати exe
+```
+
+`make_icon.ps1` нічого не перемальовує: він рендерить вектор у кожному
+цільовому розмірі (не зменшує растр) і пакує кадри в `.ico`. Розміри покривають
+трей і іконки оболонки на всіх поширених масштабах DPI — 100/125/150/175/200% —
+тож Windows бере готовий кадр, а не масштабує сусідній. Дрібні кадри лежать
+32-бітними DIB, великі (від 96 px) — PNG-стисненими, інакше сам `.ico` важив би
+174 КБ замість 74 КБ. Для рендеру потрібен Chrome або Edge (headless).
+
 ## Збірка локально
 
 ```powershell
@@ -91,8 +107,10 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `capslang.manifest` | requireAdministrator + dpiAware + visual styles |
 | `capslang.rc` | іконка, маніфест, PNG-логотип і VERSIONINFO у ресурси exe |
 | `build.ps1` | збірка: MSVC, з відкотом на mingw-w64 |
-| `capslang.ico` | іконка exe і трею |
-| `capslang.png` | той самий логотип; вшивається в exe і малюється у вікні (GDI+) |
+| `capslang.svg` | **джерело іконки** (векторний майстер-файл) |
+| `make_icon.ps1` | рендерить SVG → `capslang.ico` (12 кадрів) + `capslang.png` |
+| `capslang.ico` | іконка exe і трею: 16/20/24/28/32/40/48/56/64/96/128/256 |
+| `capslang.png` | той самий логотип 256 px; вшивається в exe і малюється у вікні (GDI+) |
 | `screenshot.png` | вигляд вікна налаштувань |
 | `.github/workflows/release.yml` | CI: збірка на Windows + реліз із exe по тегу `v*` |
 
@@ -103,6 +121,5 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 - Задача автозапуску тригериться на логон будь-якого користувача машини
   (стандартна поведінка `schtasks /SC ONLOGON`); на однокористувацькій
   машині неважливо.
-- `capslang.ico` містить один розмір (128×128) — для трею Windows масштабує
-  його сам. Якщо іконка в треї здається м'якою, у .ico варто додати кадри
-  16/24/32/48.
+- На 16–20 px (трей при 100–125% масштабу) глиф `Q` візуально легший за `Й`:
+  тонші штрихи й менш насичений синій. На 32 px і вище баланс нормальний.
