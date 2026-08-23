@@ -16,7 +16,8 @@ Set-Location $PSScriptRoot
 
 $LIBS = @(
     "user32.lib", "gdi32.lib", "shell32.lib", "comctl32.lib",
-    "shlwapi.lib", "ole32.lib", "oleaut32.lib", "gdiplus.lib", "taskschd.lib"
+    "shlwapi.lib", "ole32.lib", "oleaut32.lib", "gdiplus.lib", "taskschd.lib",
+    "advapi32.lib"   # реєстр: mingw лінкує його сам, MSVC вимагає явно
 )
 
 function Find-VcVars {
@@ -84,7 +85,7 @@ function Build-Mingw {
     # status codes rather than throwing; this drops ~240 KB of C++ runtime.
     & $gxx capslang.cpp capslang_res.o -o capslang.exe `
         -municode -mwindows -O2 -s -static -fno-exceptions -fno-rtti `
-        -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -loleaut32 -lcomctl32 -ltaskschd -luuid
+        -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -loleaut32 -lcomctl32 -ltaskschd -luuid -ladvapi32
     if ($LASTEXITCODE -ne 0) { throw "compile failed" }
 
     Remove-Item capslang_res.o -ErrorAction SilentlyContinue
