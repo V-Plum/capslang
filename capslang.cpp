@@ -1,10 +1,20 @@
 // capslang — перемикання розкладки клавіатури по CapsLock (Windows 11).
 //
-// Механізм: RegisterHotKey(VK_CAPITAL) — система проковтує CapsLock до того,
-// як його побачить будь-який застосунок; реєстрація ексклюзивна і не
-// "відвалюється" з часом (на відміну від low-level hook).
-// Shift+CapsLock не матчиться хоткеєм без модифікаторів → лишається
-// звичайним перемикачем регістру.
+// Механізм: low-level клавіатурний хук, який ковтає CapsLock (повертає 1) і
+// віддає роботу головному потоку. RegisterHotKey тут НЕ підходить, хоч і
+// виглядає охайніше: він перехоплює доставку повідомлення, але сам тогл
+// Caps Lock відбувається рівнем нижче й однаково спрацьовує, тобто після
+// кожного непарного перемикання розкладки лишався ввімкнений капс. Скасувати
+// той тогл ін'єкцією CapsLock теж не вийде — власну ін'єкцію з'їдає власна ж
+// реєстрація хоткея (перевірено: SendInput проходить, WM_HOTKEY не приходить,
+// стан не змінюється). Хук — єдиний спосіб не дати капсу перемкнутися.
+//
+// Shift+CapsLock хук пропускає далі → лишається звичайним Caps Lock.
+//
+// Ціна хука: Windows знімає його, якщо колбек не встигає за
+// LowLevelHooksTimeout. Тому в колбеку немає нічого, крім перевірки клавіші й
+// PostMessage — уся робота (перелік розкладок, надсилання повідомлень чужим
+// вікнам) виконується вже в циклі повідомлень.
 //
 // Маніфест requireAdministrator: без нього UIPI блокує
 // WM_INPUTLANGCHANGEREQUEST у бік elevated-вікон (адмінський термінал тощо).
@@ -30,23 +40,41 @@ namespace {
 
 constexpr UINT WMAPP_TRAY         = WM_APP + 1;
 constexpr UINT WMAPP_SHOWSETTINGS = WM_APP + 2;
-constexpr int  HOTKEY_ID     = 1;
-constexpr int  IDC_AUTOSTART = 100;
-constexpr int  IDC_COPYRIGHT = 101;
-constexpr int  IDR_LOGO_PNG  = 100;  // RCDATA з capslang.png
-constexpr UINT IDM_SETTINGS  = 1;
-constexpr UINT IDM_EXIT      = 2;
+constexpr UINT WMAPP_SWITCH       = WM_APP + 3;
+constexpr int  IDC_AUTOSTART   = 100;
+constexpr int  IDC_COPYRIGHT   = 101;
+constexpr int  IDC_MODE_HOOK   = 102;
+constexpr int  IDC_MODE_HOTKEY = 103;
+constexpr int  IDC_MODE_HINT   = 104;
+constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
+constexpr int  HOTKEY_ID       = 1;
+constexpr UINT IDM_SETTINGS    = 1;
+constexpr UINT IDM_EXIT        = 2;
 
 const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
+const wchar_t* kRegPath  = L"Software\\capslang";
+const wchar_t* kRegMode  = L"Mode";
+
+// Два способи перехопити клавішу. Основний тримає Caps Lock вимкненим, але це
+// клавіатурний хук, який деякі захисні програми не люблять; запасний працює
+// через системну реєстрацію клавіші й нічого не перехоплює, але тоді Windows
+// сама перемикає Caps Lock — див. коментар на початку файлу.
+enum class Mode { Hook = 0, Hotkey = 1 };
 
 NOTIFYICONDATAW g_nid = {};
 HWND g_checkbox = nullptr;
+HWND g_modeHint = nullptr;
 UINT g_taskbarCreatedMsg = 0;
+Mode g_mode = Mode::Hook;
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
 RECT g_logoRect = {};  // куди малювати логотип (пікселі клієнтської області)
+
+HHOOK g_hook = nullptr;
+HWND  g_mainWnd = nullptr;
+bool  g_capsDown = false;  // щоб автоповтор не перемикав розкладку нескінченно
 
 // ---------- перемикання розкладки ----------
 
@@ -88,6 +116,84 @@ void SwitchLayout()
         PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)next);
     else
         ActivateKeyboardLayout(next, 0);
+}
+
+// ---------- перехоплення клавіші ----------
+//
+// Колбек свідомо мінімальний: усе, що складніше за PostMessage, ризикує не
+// вкластися в LowLevelHooksTimeout, після чого Windows тихо зніме хук — і
+// утиліта "просто перестане працювати" без жодної помилки.
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+    if (nCode != HC_ACTION)
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lParam;
+    if (k->vkCode != VK_CAPITAL)
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    // Shift+CapsLock лишається справжнім Caps Lock — пропускаємо як є
+    if ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000)) {
+        g_capsDown = false;
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    }
+
+    if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
+        if (!g_capsDown) {
+            g_capsDown = true;
+            PostMessageW(g_mainWnd, WMAPP_SWITCH, 0, 0);
+        }
+        return 1;  // саме це не дає перемкнутися регістру
+    }
+
+    if (wParam == WM_KEYUP || wParam == WM_SYSKEYUP) {
+        g_capsDown = false;
+        return 1;
+    }
+
+    return CallNextHookEx(g_hook, nCode, wParam, lParam);
+}
+
+// ---------- режим роботи ----------
+
+void StopInterception()
+{
+    if (g_hook) {
+        UnhookWindowsHookEx(g_hook);
+        g_hook = nullptr;
+    }
+    UnregisterHotKey(g_mainWnd, HOTKEY_ID);
+    g_capsDown = false;
+}
+
+bool StartInterception(Mode mode)
+{
+    if (mode == Mode::Hook) {
+        g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                   GetModuleHandleW(nullptr), 0);
+        return g_hook != nullptr;
+    }
+    return RegisterHotKey(g_mainWnd, HOTKEY_ID, MOD_NOREPEAT, VK_CAPITAL) != FALSE;
+}
+
+Mode LoadMode()
+{
+    DWORD value = 0, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegPath, kRegMode, RRF_RT_REG_DWORD,
+                     nullptr, &value, &size) == ERROR_SUCCESS && value == 1)
+        return Mode::Hotkey;
+    return Mode::Hook;
+}
+
+void SaveMode(Mode mode)
+{
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD value = (mode == Mode::Hotkey) ? 1 : 0;
+    RegSetValueExW(key, kRegMode, 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
+    RegCloseKey(key);
 }
 
 // ---------- автозапуск (Task Scheduler через COM) ----------
@@ -291,6 +397,36 @@ void ShowSettings(HWND hwnd)
     SetForegroundWindow(hwnd);
 }
 
+void UpdateModeHint()
+{
+    SetWindowTextW(g_modeHint, g_mode == Mode::Hook
+        ? L"CapsLock лише перемикає мову й не вмикає великі літери."
+        : L"Оберіть, якщо основний режим не працює або конфліктує з іншою програмою.");
+}
+
+// Перемикання режиму наживо: знімаємо поточний перехоплювач і ставимо інший.
+void ApplyMode(HWND hwnd, Mode mode)
+{
+    StopInterception();
+    if (!StartInterception(mode)) {
+        // не вийшло — вертаємось на те, що працювало
+        if (StartInterception(g_mode)) {
+            MessageBoxW(hwnd, L"Цей режим зараз недоступний — залишено попередній.",
+                        L"capslang", MB_ICONWARNING | MB_OK);
+        } else {
+            MessageBoxW(hwnd, L"Не вдалося перехопити клавішу CapsLock.",
+                        L"capslang", MB_ICONERROR | MB_OK);
+        }
+    } else {
+        g_mode = mode;
+        SaveMode(mode);
+    }
+
+    CheckRadioButton(hwnd, IDC_MODE_HOOK, IDC_MODE_HOTKEY,
+                     g_mode == Mode::Hook ? IDC_MODE_HOOK : IDC_MODE_HOTKEY);
+    UpdateModeHint();
+}
+
 void ShowTrayMenu(HWND hwnd)
 {
     POINT pt;
@@ -313,8 +449,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     switch (msg) {
-    case WM_HOTKEY:
-        if (wp == HOTKEY_ID) SwitchLayout();
+    case WMAPP_SWITCH:   // від хука
+    case WM_HOTKEY:      // від системної реєстрації клавіші
+        SwitchLayout();
         return 0;
 
     case WMAPP_SHOWSETTINGS:
@@ -345,6 +482,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SendMessageW(g_checkbox, BM_SETCHECK,
                              AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             }
+            return 0;
+        case IDC_MODE_HOOK:
+            if (HIWORD(wp) == BN_CLICKED && g_mode != Mode::Hook)
+                ApplyMode(hwnd, Mode::Hook);
+            return 0;
+        case IDC_MODE_HOTKEY:
+            if (HIWORD(wp) == BN_CLICKED && g_mode != Mode::Hotkey)
+                ApplyMode(hwnd, Mode::Hotkey);
             return 0;
         case IDM_SETTINGS:
             ShowSettings(hwnd);
@@ -419,7 +564,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    const int w = sc(440), h = sc(176);
+    const int w = sc(460), h = sc(246);
     RECT rc = { 0, 0, w, h };
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU, FALSE);
     HWND hwnd = CreateWindowW(kWndClass, L"capslang", WS_CAPTION | WS_SYSMENU,
@@ -437,14 +582,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         SendMessageW(c, WM_SETFONT, (WPARAM)font, TRUE);
         return c;
     };
-    mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 20, 18, 296, 20, 0);
-    mk(L"STATIC", L"Shift + CapsLock — звичайний Caps Lock", 0, 20, 42, 296, 20, 0);
+    mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 20, 16, 300, 20, 0);
+    mk(L"STATIC", L"Shift + CapsLock — звичайний Caps Lock", 0, 20, 40, 300, 20, 0);
     g_checkbox = mk(L"BUTTON", L"Запускати при вході в Windows",
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 20, 86, 296, 24, IDC_AUTOSTART);
-    mk(L"STATIC", L"© Plum, 2026", 0, 20, 142, 200, 18, IDC_COPYRIGHT);
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 20, 74, 300, 24, IDC_AUTOSTART);
+
+    mk(L"STATIC", L"Режим роботи:", 0, 20, 118, 200, 20, 0);
+    mk(L"BUTTON", L"Основний", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
+       20, 142, 130, 22, IDC_MODE_HOOK);
+    mk(L"BUTTON", L"Запасний", BS_AUTORADIOBUTTON,
+       160, 142, 130, 22, IDC_MODE_HOTKEY);
+    g_modeHint = mk(L"STATIC", L"", 0, 20, 170, 420, 20, IDC_MODE_HINT);
+
+    mk(L"STATIC", L"© Plum, 2026", 0, 20, 210, 200, 18, IDC_COPYRIGHT);
 
     // Логотип праворуч від налаштувань
-    SetRect(&g_logoRect, sc(336), sc(30), sc(336 + 84), sc(30 + 84));
+    SetRect(&g_logoRect, sc(354), sc(22), sc(354 + 84), sc(22 + 84));
 
     g_nid.cbSize = sizeof(g_nid);
     g_nid.hWnd   = hwnd;
@@ -457,14 +610,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     lstrcpyW(g_nid.szTip, L"capslang — CapsLock перемикає розкладку");
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
-    if (!RegisterHotKey(hwnd, HOTKEY_ID, MOD_NOREPEAT, VK_CAPITAL)) {
-        Shell_NotifyIconW(NIM_DELETE, &g_nid);
-        MessageBoxW(nullptr,
-            L"Не вдалося зареєструвати CapsLock:\n"
-            L"клавішу вже перехопила інша програма.",
-            L"capslang", MB_ICONERROR | MB_OK);
-        return 1;
+    g_mainWnd = hwnd;
+    g_mode = LoadMode();
+    if (!StartInterception(g_mode)) {
+        // збережений режим не піднявся — пробуємо інший, щоб утиліта не була мертвою
+        Mode other = (g_mode == Mode::Hook) ? Mode::Hotkey : Mode::Hook;
+        if (!StartInterception(other)) {
+            Shell_NotifyIconW(NIM_DELETE, &g_nid);
+            MessageBoxW(nullptr, L"Не вдалося перехопити клавішу CapsLock.",
+                        L"capslang", MB_ICONERROR | MB_OK);
+            return 1;
+        }
+        g_mode = other;
     }
+    CheckRadioButton(hwnd, IDC_MODE_HOOK, IDC_MODE_HOTKEY,
+                     g_mode == Mode::Hook ? IDC_MODE_HOOK : IDC_MODE_HOTKEY);
+    UpdateModeHint();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {
@@ -474,7 +635,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         }
     }
 
-    UnregisterHotKey(hwnd, HOTKEY_ID);
+    StopInterception();
     delete g_logo;
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
