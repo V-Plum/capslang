@@ -29,6 +29,16 @@ jobs:
           "size: $($exe.Length) bytes"
           $exe.VersionInfo | Format-List ProductName, FileVersion, CompanyName, LegalCopyright
 
+      # Catches the easy mistake of tagging a release without bumping the
+      # version in capslang.rc - the release then ships mislabelled.
+      - name: Version must match the tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $want = ($env:GITHUB_REF_NAME -replace '^v','') + '.0'
+          $got = (Get-Item capslang.exe).VersionInfo.FileVersion
+          if ($got -ne $want) { throw "capslang.rc says $got, tag says $want" }
+          "version ok: $got"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
