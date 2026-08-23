@@ -32,7 +32,24 @@ Shift+CapsLock for regular Caps Lock. Single-file tray app, no dependencies.*
 - Іконка трею переживає перезапуск Explorer (обробка `TaskbarCreated`).
 - Один екземпляр (named mutex `capslang_single_instance`).
 
-## Збірка
+## Готовий exe
+
+Останній реліз — на вкладці [Releases](../../releases): `capslang.exe`
+збирається GitHub Actions на `windows-latest` і чіпляється до релізу.
+Новий реліз = пуш тега:
+
+```powershell
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+Ручний запуск workflow (вкладка Actions → build → Run workflow) лише збирає
+exe і кладе його в артефакти прогону, релізу не створює.
+
+Exe не підписаний, тож при першому запуску Windows SmartScreen покаже
+попередження («More info» → «Run anyway»).
+
+## Збірка локально
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
@@ -53,6 +70,7 @@ powershell -ExecutionPolicy Bypass -File build.ps1
 | `capslang.ico` | іконка exe і трею |
 | `capslang.png` | той самий логотип; вшивається в exe і малюється у вікні (GDI+) |
 | `screenshot.png` | вигляд вікна налаштувань |
+| `.github/workflows/release.yml` | CI: збірка на Windows + реліз із exe по тегу `v*` |
 
 ## Відомі обмеження
 
