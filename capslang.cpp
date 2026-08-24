@@ -12,9 +12,10 @@
 // Shift+CapsLock хук пропускає далі → лишається звичайним Caps Lock.
 //
 // Ціна хука: Windows знімає його, якщо колбек не встигає за
-// LowLevelHooksTimeout. Тому в колбеку немає нічого, крім перевірки клавіші й
-// PostMessage — уся робота (перелік розкладок, надсилання повідомлень чужим
-// вікнам) виконується вже в циклі повідомлень.
+// LowLevelHooksTimeout (~300 мс). Тому, по-перше, колбек не робить нічого, крім
+// перевірки клавіші й PostMessage; по-друге, хук живе на ОКРЕМОМУ потоці з
+// власним циклом повідомлень — щоб зайнятість UI-потоку (наприклад, синхронні
+// COM-виклики планувальника при вмиканні автозапуску) не могла задушити колбек.
 //
 // Маніфест requireAdministrator: без нього UIPI блокує
 // WM_INPUTLANGCHANGEREQUEST у бік elevated-вікон (адмінський термінал тощо).
@@ -41,6 +42,8 @@ namespace {
 constexpr UINT WMAPP_TRAY         = WM_APP + 1;
 constexpr UINT WMAPP_SHOWSETTINGS = WM_APP + 2;
 constexpr UINT WMAPP_SWITCH       = WM_APP + 3;
+constexpr UINT HKW_INSTALL        = WM_APP + 20;  // до вікна потоку хука
+constexpr UINT HKW_UNINSTALL      = WM_APP + 21;
 constexpr int  IDC_AUTOSTART   = 100;
 constexpr int  IDC_COPYRIGHT   = 101;
 constexpr int  IDC_MODE_HOOK   = 102;
@@ -72,9 +75,14 @@ ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
 RECT g_logoRect = {};  // куди малювати логотип (пікселі клієнтської області)
 
-HHOOK g_hook = nullptr;
-HWND  g_mainWnd = nullptr;
-bool  g_capsDown = false;  // щоб автоповтор не перемикав розкладку нескінченно
+HHOOK  g_hook = nullptr;
+HWND   g_mainWnd = nullptr;
+bool   g_capsDown = false;  // щоб автоповтор не перемикав розкладку нескінченно
+
+// Хук живе на власному потоці (див. коментар біля HookThreadProc)
+HANDLE g_hookThread = nullptr;
+DWORD  g_hookThreadId = 0;
+HWND   g_hookWnd = nullptr;   // message-only вікно того потоку для команд install/uninstall
 
 // ---------- перемикання розкладки ----------
 
@@ -93,8 +101,15 @@ HWND GetFocusedWindow()
 
 HKL NextLayout(HWND target)
 {
-    HKL list[16];
-    UINT n = GetKeyboardLayoutList(16, list);
+    // Запитуємо реальну кількість, а не сподіваємось на фіксований розмір:
+    // інакше в людини з багатьма розкладками поточна могла б не потрапити у
+    // зрізаний список і перемикання стрибало б на першу.
+    UINT n = GetKeyboardLayoutList(0, nullptr);
+    if (n < 2) return nullptr;
+
+    HKL list[64];
+    if (n > 64) n = 64;
+    n = GetKeyboardLayoutList(n, list);
     if (n < 2) return nullptr;
 
     DWORD tid = target ? GetWindowThreadProcessId(target, nullptr) : 0;
@@ -154,25 +169,93 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     return CallNextHookEx(g_hook, nCode, wParam, lParam);
 }
 
-// ---------- режим роботи ----------
-
-void StopInterception()
+// Потік хука: нічого не робить, крім циклу повідомлень, тож колбек
+// обслуговується миттєво незалежно від того, чим зайнятий UI-потік. Команди
+// install/uninstall приходять синхронно через SendMessage до цього вікна —
+// SetWindowsHookEx мусить викликатися саме на тому потоці, де крутиться цикл,
+// бо колбек виконується в його контексті.
+LRESULT CALLBACK HookWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    switch (msg) {
+    case HKW_INSTALL:
+        if (!g_hook)
+            g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+                                       GetModuleHandleW(nullptr), 0);
+        return g_hook != nullptr;
+    case HKW_UNINSTALL:
+        if (g_hook) {
+            UnhookWindowsHookEx(g_hook);
+            g_hook = nullptr;
+        }
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+DWORD WINAPI HookThreadProc(LPVOID param)
+{
+    HANDLE ready = (HANDLE)param;
+    HINSTANCE inst = GetModuleHandleW(nullptr);
+
+    WNDCLASSW wc = {};
+    wc.lpfnWndProc   = HookWndProc;
+    wc.hInstance     = inst;
+    wc.lpszClassName = L"capslang_hook";
+    RegisterClassW(&wc);
+
+    g_hookWnd = CreateWindowExW(0, L"capslang_hook", nullptr, 0,
+                                0, 0, 0, 0, HWND_MESSAGE, nullptr, inst, nullptr);
+    SetEvent(ready);  // головний потік чекає, поки вікно готове
+
+    MSG msg;
+    while (GetMessageW(&msg, nullptr, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
     if (g_hook) {
         UnhookWindowsHookEx(g_hook);
         g_hook = nullptr;
     }
+    return 0;
+}
+
+bool StartHookThread()
+{
+    HANDLE ready = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    if (!ready) return false;
+    g_hookThread = CreateThread(nullptr, 0, HookThreadProc, ready, 0, &g_hookThreadId);
+    if (g_hookThread)
+        WaitForSingleObject(ready, INFINITE);
+    CloseHandle(ready);
+    return g_hookThread != nullptr && g_hookWnd != nullptr;
+}
+
+void StopHookThread()
+{
+    if (g_hookThreadId)
+        PostThreadMessageW(g_hookThreadId, WM_QUIT, 0, 0);
+    if (g_hookThread) {
+        WaitForSingleObject(g_hookThread, 2000);
+        CloseHandle(g_hookThread);
+        g_hookThread = nullptr;
+    }
+}
+
+// ---------- режим роботи ----------
+
+void StopInterception()
+{
+    if (g_hookWnd)
+        SendMessageW(g_hookWnd, HKW_UNINSTALL, 0, 0);  // на потоці хука
     UnregisterHotKey(g_mainWnd, HOTKEY_ID);
     g_capsDown = false;
 }
 
 bool StartInterception(Mode mode)
 {
-    if (mode == Mode::Hook) {
-        g_hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
-                                   GetModuleHandleW(nullptr), 0);
-        return g_hook != nullptr;
-    }
+    if (mode == Mode::Hook)
+        return g_hookWnd && SendMessageW(g_hookWnd, HKW_INSTALL, 0, 0) != 0;
     return RegisterHotKey(g_mainWnd, HOTKEY_ID, MOD_NOREPEAT, VK_CAPITAL) != FALSE;
 }
 
@@ -477,7 +560,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 bool want = SendMessageW(g_checkbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 if (!SetAutostart(want))
                     MessageBoxW(hwnd,
-                        L"Не вдалося змінити задачу автозапуску (schtasks).",
+                        L"Не вдалося змінити задачу автозапуску.",
                         L"capslang", MB_ICONERROR | MB_OK);
                 SendMessageW(g_checkbox, BM_SETCHECK,
                              AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -611,6 +694,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     g_mainWnd = hwnd;
+    StartHookThread();  // має бути до StartInterception у режимі Hook
     g_mode = LoadMode();
     if (!StartInterception(g_mode)) {
         // збережений режим не піднявся — пробуємо інший, щоб утиліта не була мертвою
@@ -636,6 +720,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
 
     StopInterception();
+    StopHookThread();
     delete g_logo;
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
