@@ -49,6 +49,8 @@ constexpr int  IDC_COPYRIGHT   = 101;
 constexpr int  IDC_MODE_HOOK   = 102;
 constexpr int  IDC_MODE_HOTKEY = 103;
 constexpr int  IDC_MODE_HINT   = 104;
+constexpr int  IDC_PASSTHROUGH      = 105;
+constexpr int  IDC_PASSTHROUGH_HINT = 106;
 constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
 constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
@@ -58,6 +60,7 @@ const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
 const wchar_t* kRegPath  = L"Software\\capslang";
 const wchar_t* kRegMode  = L"Mode";
+const wchar_t* kRegPassthrough = L"PassthroughRemote";
 
 // Два способи перехопити клавішу. Основний тримає Caps Lock вимкненим, але це
 // клавіатурний хук, який деякі захисні програми не люблять; запасний працює
@@ -70,6 +73,14 @@ HWND g_checkbox = nullptr;
 HWND g_modeHint = nullptr;
 UINT g_taskbarCreatedMsg = 0;
 Mode g_mode = Mode::Hook;
+
+// CAPS-1: не перехоплювати Caps у вікнах віддалених/віртуальних машин.
+volatile bool g_passthrough = true;   // налаштування (чекбокс), збереж. у реєстрі
+volatile bool g_inRemote    = false;  // активне вікно — remote/VM (оновлює WinEvent)
+bool  g_interceptionOn = false;       // перехоплення активне (для Hotkey-контексту)
+bool  g_hotkeyActive   = false;       // RegisterHotKey зараз тримається
+HWINEVENTHOOK g_winEvent = nullptr;
+HWND  g_passthroughCheckbox = nullptr;
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
@@ -133,6 +144,41 @@ void SwitchLayout()
         ActivateKeyboardLayout(next, 0);
 }
 
+// ---------- CAPS-1: виявлення remote/VM-вікон ----------
+//
+// Вікна цих процесів вважаємо клієнтом віддаленої/віртуальної машини. У них
+// Caps треба ПРОПУСТИТИ, щоб розкладку перемкнула гостьова ОС (де теж стоїть
+// capslang), а не перехоплювати його на хості. Список фіксований (v1).
+bool IsRemoteWindow(HWND w)
+{
+    if (!w) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (!pid) return false;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return false;
+    wchar_t path[MAX_PATH];
+    DWORD len = MAX_PATH;
+    bool ok = QueryFullProcessImageNameW(h, 0, path, &len) != FALSE;
+    CloseHandle(h);
+    if (!ok) return false;
+
+    const wchar_t* name = PathFindFileNameW(path);
+    static const wchar_t* const kRemoteProcs[] = {
+        L"mstsc.exe",     // Remote Desktop (класичний RDP)
+        L"msrdc.exe",     // Windows App / новий Remote Desktop-клієнт
+        L"vmware.exe",    // VMware Workstation/Player (вікно консолі ВМ)
+        L"vmconnect.exe", // Hyper-V (консоль підключення до ВМ)
+    };
+    for (const wchar_t* p : kRemoteProcs)
+        if (lstrcmpiW(name, p) == 0)
+            return true;
+    return false;
+}
+
+bool RemotePassthroughActive() { return g_passthrough && g_inRemote; }
+
 // ---------- перехоплення клавіші ----------
 //
 // Колбек свідомо мінімальний: усе, що складніше за PostMessage, ризикує не
@@ -146,6 +192,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam)
     const KBDLLHOOKSTRUCT* k = (const KBDLLHOOKSTRUCT*)lParam;
     if (k->vkCode != VK_CAPITAL)
         return CallNextHookEx(g_hook, nCode, wParam, lParam);
+
+    // CAPS-1: у вікні віддаленої/віртуальної машини не перехоплюємо — Caps іде
+    // далі, розкладку перемикає гостьова ОС.
+    if (g_passthrough && g_inRemote) {
+        g_capsDown = false;
+        return CallNextHookEx(g_hook, nCode, wParam, lParam);
+    }
 
     // Shift+CapsLock лишається справжнім Caps Lock — пропускаємо як є
     if ((GetAsyncKeyState(VK_LSHIFT) & 0x8000) || (GetAsyncKeyState(VK_RSHIFT) & 0x8000)) {
@@ -244,19 +297,72 @@ void StopHookThread()
 
 // ---------- режим роботи ----------
 
+// Реєстрація/зняття системного хоткея під бажаний стан.
+// false — лише при реальній невдачі RegisterHotKey.
+bool SetHotkey(bool want)
+{
+    if (want && !g_hotkeyActive) {
+        if (!RegisterHotKey(g_mainWnd, HOTKEY_ID, MOD_NOREPEAT, VK_CAPITAL))
+            return false;
+        g_hotkeyActive = true;
+    } else if (!want && g_hotkeyActive) {
+        UnregisterHotKey(g_mainWnd, HOTKEY_ID);
+        g_hotkeyActive = false;
+    }
+    return true;
+}
+
 void StopInterception()
 {
     if (g_hookWnd)
         SendMessageW(g_hookWnd, HKW_UNINSTALL, 0, 0);  // на потоці хука
-    UnregisterHotKey(g_mainWnd, HOTKEY_ID);
+    SetHotkey(false);
+    g_interceptionOn = false;
     g_capsDown = false;
 }
 
 bool StartInterception(Mode mode)
 {
-    if (mode == Mode::Hook)
-        return g_hookWnd && SendMessageW(g_hookWnd, HKW_INSTALL, 0, 0) != 0;
-    return RegisterHotKey(g_mainWnd, HOTKEY_ID, MOD_NOREPEAT, VK_CAPITAL) != FALSE;
+    if (mode == Mode::Hook) {
+        bool ok = g_hookWnd && SendMessageW(g_hookWnd, HKW_INSTALL, 0, 0) != 0;
+        if (ok) g_interceptionOn = true;
+        return ok;
+    }
+    // Hotkey: якщо ми зараз у remote-вікні з увімкненим пропуском — свідомо НЕ
+    // реєструємо (щоб Caps ішов у клієнта); зареєструємо при виході з нього.
+    if (RemotePassthroughActive()) {
+        g_hotkeyActive = false;
+        g_interceptionOn = true;
+        return true;
+    }
+    if (!SetHotkey(true))
+        return false;
+    g_interceptionOn = true;
+    return true;
+}
+
+// CAPS-1: привести перехоплення до поточного контексту (режим/налаштування/вікно).
+// Hook: колбек читає прапорці наживо. Hotkey: тримаємо реєстрацію лише поза
+// remote-вікнами (або коли пропуск вимкнено).
+void ApplyRemoteContext()
+{
+    if (g_interceptionOn && g_mode == Mode::Hotkey)
+        SetHotkey(!RemotePassthroughActive());
+}
+
+// Зміна активного вікна: оновлюємо ознаку remote і підлаштовуємо перехоплення.
+// Викликається з WinEvent-колбека на головному потоці — тому RegisterHotKey
+// коректно виконується на потоці-власнику g_mainWnd.
+void OnForegroundChanged()
+{
+    g_inRemote = IsRemoteWindow(GetForegroundWindow());
+    ApplyRemoteContext();
+}
+
+void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND, LONG, LONG, DWORD, DWORD)
+{
+    if (event == EVENT_SYSTEM_FOREGROUND)
+        OnForegroundChanged();
 }
 
 Mode LoadMode()
@@ -276,6 +382,26 @@ void SaveMode(Mode mode)
         return;
     DWORD value = (mode == Mode::Hotkey) ? 1 : 0;
     RegSetValueExW(key, kRegMode, 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
+    RegCloseKey(key);
+}
+
+bool LoadPassthrough()
+{
+    DWORD value = 1, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kRegPath, kRegPassthrough, RRF_RT_REG_DWORD,
+                     nullptr, &value, &size) == ERROR_SUCCESS)
+        return value != 0;
+    return true;  // за замовчуванням увімкнено
+}
+
+void SavePassthrough(bool on)
+{
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    DWORD value = on ? 1 : 0;
+    RegSetValueExW(key, kRegPassthrough, 0, REG_DWORD, (const BYTE*)&value, sizeof(value));
     RegCloseKey(key);
 }
 
@@ -574,6 +700,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == BN_CLICKED && g_mode != Mode::Hotkey)
                 ApplyMode(hwnd, Mode::Hotkey);
             return 0;
+        case IDC_PASSTHROUGH:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_passthrough = SendMessageW(g_passthroughCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                SavePassthrough(g_passthrough);
+                ApplyRemoteContext();
+            }
+            return 0;
         case IDM_SETTINGS:
             ShowSettings(hwnd);
             return 0;
@@ -589,7 +722,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CTLCOLORSTATIC:
         SetBkMode((HDC)wp, TRANSPARENT);
-        if (GetDlgCtrlID((HWND)lp) == IDC_COPYRIGHT)
+        if (GetDlgCtrlID((HWND)lp) == IDC_COPYRIGHT ||
+            GetDlgCtrlID((HWND)lp) == IDC_PASSTHROUGH_HINT)
             SetTextColor((HDC)wp, GetSysColor(COLOR_GRAYTEXT));
         return (LRESULT)GetSysColorBrush(COLOR_BTNFACE);
 
@@ -647,7 +781,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    const int w = sc(460), h = sc(246);
+    const int w = sc(460), h = sc(304);
     RECT rc = { 0, 0, w, h };
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU, FALSE);
     HWND hwnd = CreateWindowW(kWndClass, L"capslang", WS_CAPTION | WS_SYSMENU,
@@ -677,7 +811,16 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
        160, 142, 130, 22, IDC_MODE_HOTKEY);
     g_modeHint = mk(L"STATIC", L"", 0, 20, 170, 420, 20, IDC_MODE_HINT);
 
-    mk(L"STATIC", L"© Plum, 2026", 0, 20, 210, 200, 18, IDC_COPYRIGHT);
+    g_passthrough = LoadPassthrough();
+    g_passthroughCheckbox = mk(L"BUTTON",
+        L"Не перехоплювати Caps Lock при роботі з віртуальними та віддаленими машинами",
+        BS_AUTOCHECKBOX | BS_MULTILINE | WS_TABSTOP, 20, 198, 420, 38, IDC_PASSTHROUGH);
+    SendMessageW(g_passthroughCheckbox, BM_SETCHECK,
+                 g_passthrough ? BST_CHECKED : BST_UNCHECKED, 0);
+    mk(L"STATIC", L"Працює з: Remote Desktop, Windows App, VMware Workstation, Hyper-V.",
+       0, 20, 240, 420, 18, IDC_PASSTHROUGH_HINT);
+
+    mk(L"STATIC", L"© Plum, 2026", 0, 20, 272, 200, 18, IDC_COPYRIGHT);
 
     // Логотип праворуч від налаштувань
     SetRect(&g_logoRect, sc(354), sc(22), sc(354 + 84), sc(22 + 84));
@@ -694,6 +837,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     g_mainWnd = hwnd;
+
+    // CAPS-1: стежимо за зміною активного вікна, щоб знати, коли ми в remote/VM.
+    g_inRemote = IsRemoteWindow(GetForegroundWindow());
+    g_winEvent = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
+                                 nullptr, WinEventProc, 0, 0,
+                                 WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
     StartHookThread();  // має бути до StartInterception у режимі Hook
     g_mode = LoadMode();
     if (!StartInterception(g_mode)) {
@@ -721,6 +871,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     StopInterception();
     StopHookThread();
+    if (g_winEvent) UnhookWinEvent(g_winEvent);
     delete g_logo;
     Gdiplus::GdiplusShutdown(g_gdiplusToken);
     CoUninitialize();
