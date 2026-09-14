@@ -47,6 +47,7 @@ constexpr UINT WMAPP_TRAY         = WM_APP + 1;
 constexpr UINT WMAPP_SHOWSETTINGS = WM_APP + 2;
 constexpr UINT WMAPP_SWITCH       = WM_APP + 3;
 constexpr UINT WMAPP_SHAKE        = WM_APP + 4;   // від мишачого хука: жест розпізнано
+constexpr UINT WMAPP_MAGDONE      = WM_APP + 5;   // потік анімації: зменшення завершено
 constexpr UINT HKW_INSTALL        = WM_APP + 20;  // до вікна потоку хука
 constexpr UINT HKW_UNINSTALL      = WM_APP + 21;
 constexpr UINT HKW_MOUSE_ON       = WM_APP + 22;
@@ -75,7 +76,6 @@ constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
 constexpr UINT IDM_EXIT        = 2;
 constexpr UINT TIMER_MAG_HOLD   = 1;
-constexpr UINT TIMER_MAG_SHRINK = 2;
 
 const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
@@ -134,7 +134,6 @@ bool   g_capsDown = false;  // щоб автоповтор не перемика
 constexpr UINT SPI_SETCURSORSIZE_ = 0x2029;  // недокументований, але стабільний з Win10
 constexpr int  kCursorMinPx = 32;
 constexpr int  kCursorMaxPx = 256;
-constexpr int  kShrinkSteps = 6;
 
 const wchar_t* kRegCursorEnable    = L"CursorFind";
 const wchar_t* kRegCursorScale     = L"CursorScale";
@@ -153,7 +152,7 @@ struct CursorSettings {
     bool enabled   = true;
     int  scale     = 5;     // у скільки разів збільшувати (2..8)
     int  holdMs    = 1500;  // тримати збільшеним після жесту
-    int  shrinkMs  = 300;   // тривалість плавного зменшення
+    int  shrinkMs  = 250;   // тривалість плавного зменшення
     int  windowMs  = 700;   // вікно, у якому рахуємо рухи
     int  distance  = 1000;  // мінімальний пройдений шлях, px
     int  factor    = 350;   // шлях / діагональ габариту, %
@@ -166,7 +165,17 @@ enum class MagState { Idle, Big, Shrinking };
 MagState g_magState   = MagState::Idle;
 int      g_magOrigPx  = kCursorMinPx;
 int      g_magTargetPx = kCursorMinPx;
-int      g_magShrinkStep = 0;
+
+// Зменшення крутить ОКРЕМИЙ потік і рахує розмір від ЧАСУ, а не від номера кроку.
+// Причина: кожне застосування розміру з SPIF_SENDCHANGE — синхронний бродкаст
+// WM_SETTINGCHANGE усім вікнам, і його вартість залежить від того, скільки вікон
+// відкрито й чи швидко вони відповідають (виміряно: 0.1 мс без бродкасту проти
+// ~35 мс з ним на порожньому столі, і значно більше під навантаженням). Прив'язка
+// до часу робить тривалість передбачуваною: на швидкій системі кроків більше й
+// анімація гладка, на повільній — менше, але вкладаємось у ту саму чверть секунди.
+CRITICAL_SECTION g_magLock;
+volatile LONG    g_magGen = 0;     // покоління анімації; зміна = скасування
+HANDLE           g_magThread = nullptr;
 
 // Буфер жесту (пишеться в колбеку хука, читається там само)
 struct ShakeMove { int dx, dy; DWORD tick; };
@@ -718,12 +727,33 @@ bool IsFullscreenForeground()
     return (style & (WS_CAPTION | WS_THICKFRAME)) == 0;
 }
 
+// Застосувати розмір, але лише якщо анімація ще актуальна. gen == 0 — виклик із
+// UI-потоку, він завжди має пріоритет; лок не дає потоку анімації втиснути свій
+// проміжний кадр уже після того, як UI вирішив інше.
+void ApplyCursorSizeGuarded(int px, LONG gen)
+{
+    EnterCriticalSection(&g_magLock);
+    if (gen == 0 || g_magGen == gen)
+        ApplyCursorSizePx(px);
+    LeaveCriticalSection(&g_magLock);
+}
+
+void CancelMagAnimation()
+{
+    InterlockedIncrement(&g_magGen);
+    if (g_magThread) {
+        WaitForSingleObject(g_magThread, 500);
+        CloseHandle(g_magThread);
+        g_magThread = nullptr;
+    }
+}
+
 void MagnifyRestore()
 {
     KillTimer(g_mainWnd, TIMER_MAG_HOLD);
-    KillTimer(g_mainWnd, TIMER_MAG_SHRINK);
+    CancelMagAnimation();
     if (g_magState != MagState::Idle)
-        ApplyCursorSizePx(g_magOrigPx);
+        ApplyCursorSizeGuarded(g_magOrigPx, 0);
     RegDeleteInt(kRegCursorRestore);
     g_magState = MagState::Idle;
 }
@@ -740,40 +770,61 @@ void MagnifyStart()
         int target = g_magOrigPx * g_cur.scale;
         if (target > kCursorMaxPx) target = kCursorMaxPx;
         g_magTargetPx = target;
-        ApplyCursorSizePx(target);
+        ApplyCursorSizeGuarded(target, 0);
     } else if (g_magState == MagState::Shrinking) {
-        KillTimer(g_mainWnd, TIMER_MAG_SHRINK);
-        ApplyCursorSizePx(g_magTargetPx);   // потрусили ще раз — вертаємо великий
+        CancelMagAnimation();                        // потрусили ще раз під час
+        ApplyCursorSizeGuarded(g_magTargetPx, 0);    // зменшення — вертаємо великий
     }
 
     g_magState = MagState::Big;
     SetTimer(g_mainWnd, TIMER_MAG_HOLD, (UINT)g_cur.holdMs, nullptr);
 }
 
+// Плавне зменшення потрібне, щоб око встигло провести курсор до справжнього
+// розміру (вимога тікета). Крива ease-out: спочатку швидко, під кінець м'яко.
+DWORD WINAPI MagShrinkThread(LPVOID param)
+{
+    const LONG gen = (LONG)(LONG_PTR)param;
+    const int from = g_magTargetPx, to = g_magOrigPx;
+    const DWORD duration = (DWORD)g_cur.shrinkMs;
+    const DWORD start = GetTickCount();
+
+    int last = from;
+    for (;;) {
+        if (g_magGen != gen) return 0;               // скасовано новим жестом
+        const DWORD elapsed = GetTickCount() - start;
+        if (elapsed >= duration) break;
+        double t = (double)elapsed / duration;
+        t = 1.0 - (1.0 - t) * (1.0 - t);
+        // Windows має власну сходинку розмірів курсора (32 px + кратне 16), тож
+        // проміжні значення між сходинками виглядають однаково, а коштують по
+        // повному бродкасту. Округлюємо — удвічі менше викликів без втрати плавності.
+        int px = (int)(from + (to - from) * t);
+        px = kCursorMinPx + ((px - kCursorMinPx + 8) / 16) * 16;
+        if (px != last) {
+            ApplyCursorSizeGuarded(px, gen);
+            last = px;
+        }
+        Sleep(8);
+    }
+    if (g_magGen == gen) {
+        ApplyCursorSizeGuarded(to, gen);
+        PostMessageW(g_mainWnd, WMAPP_MAGDONE, 0, (LPARAM)gen);
+    }
+    return 0;
+}
+
 void MagnifyBeginShrink()
 {
     KillTimer(g_mainWnd, TIMER_MAG_HOLD);
     if (g_magState != MagState::Big) return;
+    CancelMagAnimation();
     g_magState = MagState::Shrinking;
-    g_magShrinkStep = 0;
-    UINT interval = (UINT)(g_cur.shrinkMs / kShrinkSteps);
-    if (interval < 15) interval = 15;   // частіше за кадр немає сенсу
-    SetTimer(g_mainWnd, TIMER_MAG_SHRINK, interval, nullptr);
-}
-
-// Плавне зменшення потрібне, щоб око встигло провести курсор до його
-// справжнього розміру (вимога тікета), тому йдемо сходинками, а не стрибком.
-void MagnifyShrinkStep()
-{
-    if (g_magState != MagState::Shrinking) return;
-    g_magShrinkStep++;
-    if (g_magShrinkStep >= kShrinkSteps) {
+    const LONG gen = InterlockedIncrement(&g_magGen);
+    g_magThread = CreateThread(nullptr, 0, MagShrinkThread,
+                               (LPVOID)(LONG_PTR)gen, 0, nullptr);
+    if (!g_magThread)          // потік не створився — просто повертаємо розмір
         MagnifyRestore();
-        return;
-    }
-    const double t = (double)g_magShrinkStep / kShrinkSteps;
-    const int px = (int)(g_magTargetPx + (g_magOrigPx - g_magTargetPx) * t);
-    ApplyCursorSizePx(px);
 }
 
 // Якщо попередній запуск помер із великим курсором — повертаємо розмір.
@@ -1137,8 +1188,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == TIMER_MAG_HOLD)        MagnifyBeginShrink();
-        else if (wp == TIMER_MAG_SHRINK) MagnifyShrinkStep();
+        if (wp == TIMER_MAG_HOLD) MagnifyBeginShrink();
+        return 0;
+
+    case WMAPP_MAGDONE:   // анімація дійшла до кінця (lp = її покоління)
+        if (g_magState == MagState::Shrinking && g_magGen == (LONG)lp) {
+            RegDeleteInt(kRegCursorRestore);
+            g_magState = MagState::Idle;
+        }
         return 0;
 
     case WM_HSCROLL:
@@ -1287,6 +1344,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                                  ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES };
     InitCommonControlsEx(&icc);
 
+    InitializeCriticalSection(&g_magLock);
     LoadCursorSettings();
     // Якщо попередній запуск обірвався із збільшеним курсором — повертаємо розмір
     // ДО того, як щось показуємо користувачу.
@@ -1466,6 +1524,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
 
     MagnifyRestore();   // страховка, якщо цикл завершився повз WM_DESTROY
+    DeleteCriticalSection(&g_magLock);
     StopInterception();
     StopHookThread();
     if (g_winEvent) UnhookWinEvent(g_winEvent);
