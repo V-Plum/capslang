@@ -70,12 +70,14 @@ constexpr int  IDC_CUR_DIST      = 116;
 constexpr int  IDC_CUR_FACTOR    = 117;
 constexpr int  IDC_CUR_REVERSALS = 118;
 constexpr int  IDC_CUR_SHRINK    = 119;
+constexpr int  IDC_CUR_OVERLAY   = 121;
 constexpr int  IDC_HINT_GRAY     = 120;  // будь-який сірий пояснювальний текст
 constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
 constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
 constexpr UINT IDM_EXIT        = 2;
 constexpr UINT TIMER_MAG_HOLD   = 1;
+constexpr UINT TIMER_MAG_FRAME  = 2;   // кадр оверлейної анімації
 
 const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
@@ -114,6 +116,7 @@ HWND g_pageLayout[16] = {};  int g_pageLayoutN = 0;
 HWND g_pageCursor[24] = {};  int g_pageCursorN = 0;
 HWND g_advCtrls[16]   = {};  int g_advN = 0;
 HWND g_curEnable = nullptr, g_curScale = nullptr, g_curHold = nullptr;
+HWND g_curOverlay = nullptr;
 HWND g_curScaleVal = nullptr, g_curHoldVal = nullptr, g_curAdvBtn = nullptr;
 HWND g_edWindow = nullptr, g_edDist = nullptr, g_edFactor = nullptr;
 HWND g_edRevers = nullptr, g_edShrink = nullptr;
@@ -143,6 +146,7 @@ const wchar_t* kRegShakeWindow     = L"ShakeWindowMs";
 const wchar_t* kRegShakeDistance   = L"ShakeMinDistance";
 const wchar_t* kRegShakeFactor     = L"ShakeFactor";
 const wchar_t* kRegShakeReversals  = L"ShakeReversals";
+const wchar_t* kRegCursorOverlay   = L"CursorOverlayShrink";
 const wchar_t* kRegCursorRestore   = L"CursorRestorePx";  // аварійний слід
 
 // Дефолти підібрані на симуляції жестів (див. коментар біля ShakeFeed):
@@ -157,6 +161,7 @@ struct CursorSettings {
     int  distance  = 1000;  // мінімальний пройдений шлях, px
     int  factor    = 350;   // шлях / діагональ габариту, %
     int  reversals = 3;     // мінімум змін напрямку
+    bool overlay   = true;  // зменшувати намальованою копією, а не системним розміром
 };
 CursorSettings g_cur;
 
@@ -176,6 +181,20 @@ int      g_magTargetPx = kCursorMinPx;
 CRITICAL_SECTION g_magLock;
 volatile LONG    g_magGen = 0;     // покоління анімації; зміна = скасування
 HANDLE           g_magThread = nullptr;
+
+// Оверлейне зменшення. Системний розмір курсора анімувати неможливо: кожен кадр
+// коштує синхронного бродкасту, і на завантаженій машині виходить 2-3 стрибки
+// замість плавності. Тому тут малюємо ЗМЕНШУВАНУ КОПІЮ курсора у власному
+// layered-вікні (це звичайна композиція GPU, десятки кадрів безкоштовно), а
+// системний розмір повертаємо одним викликом у фоні. Плата — під копією видно
+// справжній курсор; він уже нормального розміру й стоїть у тій самій точці.
+HWND  g_overlay     = nullptr;
+HICON g_overlayIcon = nullptr;
+POINT g_ovHotspot   = {};
+int   g_ovBasePx    = 32;   // розмір, у якому задано гарячу точку
+int   g_ovFrom = 0, g_ovTo = 0;
+DWORD g_ovStart = 0;
+void  OverlayDestroy();   // визначення нижче, але потрібне вже у MagnifyRestore
 
 // Буфер жесту (пишеться в колбеку хука, читається там само)
 struct ShakeMove { int dx, dy; DWORD tick; };
@@ -666,6 +685,7 @@ void LoadCursorSettings()
     g_cur.distance  = RegLoadInt(kRegShakeDistance,  1200, 300,  5000);
     g_cur.factor    = RegLoadInt(kRegShakeFactor,    350,  150,  1000);
     g_cur.reversals = RegLoadInt(kRegShakeReversals, 3,    2,    10);
+    g_cur.overlay   = RegLoadInt(kRegCursorOverlay,  1,    0,    1) != 0;
 }
 
 // ---------- CAPS-2: власне збільшення ----------
@@ -751,6 +771,8 @@ void CancelMagAnimation()
 void MagnifyRestore()
 {
     KillTimer(g_mainWnd, TIMER_MAG_HOLD);
+    KillTimer(g_mainWnd, TIMER_MAG_FRAME);
+    OverlayDestroy();
     CancelMagAnimation();
     if (g_magState != MagState::Idle)
         ApplyCursorSizeGuarded(g_magOrigPx, 0);
@@ -772,8 +794,10 @@ void MagnifyStart()
         g_magTargetPx = target;
         ApplyCursorSizeGuarded(target, 0);
     } else if (g_magState == MagState::Shrinking) {
-        CancelMagAnimation();                        // потрусили ще раз під час
-        ApplyCursorSizeGuarded(g_magTargetPx, 0);    // зменшення — вертаємо великий
+        KillTimer(g_mainWnd, TIMER_MAG_FRAME);       // потрусили ще раз під час
+        OverlayDestroy();                            // зменшення — вертаємо великий
+        CancelMagAnimation();
+        ApplyCursorSizeGuarded(g_magTargetPx, 0);
     }
 
     g_magState = MagState::Big;
@@ -814,12 +838,151 @@ DWORD WINAPI MagShrinkThread(LPVOID param)
     return 0;
 }
 
+// ---------- оверлейне зменшення ----------
+
+void OverlayDestroy()
+{
+    if (g_overlay) { DestroyWindow(g_overlay); g_overlay = nullptr; }
+    if (g_overlayIcon) { DestroyIcon(g_overlayIcon); g_overlayIcon = nullptr; }
+}
+
+// Малюємо копію курсора заданого розміру в layered-вікно під гарячою точкою.
+void OverlayFrame(int size)
+{
+    if (!g_overlay || !g_overlayIcon || size < 1) return;
+
+    POINT pt;
+    GetCursorPos(&pt);
+
+    HDC screen = GetDC(nullptr);
+    HDC mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;          // top-down
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (dib && bits) {
+        HGDIOBJ old = SelectObject(mem, dib);
+        DrawIconEx(mem, 0, 0, g_overlayIcon, size, size, 0, nullptr, DI_NORMAL);
+
+        // UpdateLayeredWindow хоче premultiplied alpha. Курсори з 1-бітною маскою
+        // приходять із нульовою альфою — тоді копія була б невидимою, тож такі
+        // пікселі робимо непрозорими за наявністю кольору.
+        BYTE* p = (BYTE*)bits;
+        const int count = size * size;
+        bool anyAlpha = false;
+        for (int i = 0; i < count; ++i)
+            if (p[i * 4 + 3]) { anyAlpha = true; break; }
+        for (int i = 0; i < count; ++i) {
+            BYTE* px = p + i * 4;
+            if (!anyAlpha)
+                px[3] = (px[0] || px[1] || px[2]) ? 255 : 0;
+            const int a = px[3];
+            px[0] = (BYTE)(px[0] * a / 255);
+            px[1] = (BYTE)(px[1] * a / 255);
+            px[2] = (BYTE)(px[2] * a / 255);
+        }
+
+        POINT dst = { pt.x - MulDiv(g_ovHotspot.x, size, g_ovBasePx),
+                      pt.y - MulDiv(g_ovHotspot.y, size, g_ovBasePx) };
+        SIZE  wnd = { size, size };
+        POINT src = { 0, 0 };
+        BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+        UpdateLayeredWindow(g_overlay, screen, &dst, &wnd, mem, &src, 0, &bf, ULW_ALPHA);
+        SelectObject(mem, old);
+    }
+    if (dib) DeleteObject(dib);
+    DeleteDC(mem);
+    ReleaseDC(nullptr, screen);
+}
+
+// Системний розмір повертаємо у фоні: один виклик, але дорогий, і блокувати ним
+// анімацію не можна.
+DWORD WINAPI RestoreSizeThread(LPVOID param)
+{
+    const LONG gen = (LONG)(LONG_PTR)param;
+    ApplyCursorSizeGuarded(g_magOrigPx, gen);
+    // слід у реєстрі прибираємо аж тут: поки системний розмір не повернувся
+    // насправді, аварійне завершення має лишати можливість його відновити
+    PostMessageW(g_mainWnd, WMAPP_MAGDONE, 0, (LPARAM)gen);
+    return 0;
+}
+
+bool OverlayBeginShrink()
+{
+    CURSORINFO ci = { sizeof(ci) };
+    if (!GetCursorInfo(&ci) || !ci.hCursor || !(ci.flags & CURSOR_SHOWING))
+        return false;
+    HICON copy = CopyIcon(ci.hCursor);
+    if (!copy) return false;
+
+    ICONINFO ii = {};
+    if (GetIconInfo(copy, &ii)) {
+        g_ovHotspot.x = (LONG)ii.xHotspot;
+        g_ovHotspot.y = (LONG)ii.yHotspot;
+        BITMAP bm = {};
+        HBITMAP src = ii.hbmColor ? ii.hbmColor : ii.hbmMask;
+        g_ovBasePx = (GetObjectW(src, sizeof(bm), &bm) && bm.bmWidth > 0) ? bm.bmWidth : 32;
+        if (ii.hbmColor) DeleteObject(ii.hbmColor);
+        if (ii.hbmMask)  DeleteObject(ii.hbmMask);
+    } else {
+        g_ovHotspot.x = g_ovHotspot.y = 0;
+        g_ovBasePx = 32;
+    }
+
+    OverlayDestroy();
+    g_overlayIcon = copy;
+    g_overlay = CreateWindowExW(WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST |
+                                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                                L"capslang_overlay", nullptr, WS_POPUP,
+                                0, 0, 1, 1, nullptr, nullptr,
+                                GetModuleHandleW(nullptr), nullptr);
+    if (!g_overlay) { OverlayDestroy(); return false; }
+    ShowWindow(g_overlay, SW_SHOWNOACTIVATE);
+
+    g_ovFrom  = g_magTargetPx;
+    g_ovTo    = g_magOrigPx;
+    g_ovStart = GetTickCount();
+    OverlayFrame(g_ovFrom);
+
+    // системний розмір вертаємо паралельно — копія прикриє момент перемикання
+    const LONG gen = InterlockedIncrement(&g_magGen);
+    if (HANDLE t = CreateThread(nullptr, 0, RestoreSizeThread, (LPVOID)(LONG_PTR)gen, 0, nullptr))
+        CloseHandle(t);
+
+    SetTimer(g_mainWnd, TIMER_MAG_FRAME, 16, nullptr);   // ~60 кадрів/с
+    return true;
+}
+
+void OverlayFrameTick()
+{
+    const DWORD elapsed = GetTickCount() - g_ovStart;
+    const DWORD duration = (DWORD)g_cur.shrinkMs;
+    if (elapsed >= duration) {
+        KillTimer(g_mainWnd, TIMER_MAG_FRAME);
+        OverlayDestroy();
+        g_magState = MagState::Idle;   // слід у реєстрі знімає RestoreSizeThread
+        return;
+    }
+    double t = (double)elapsed / duration;
+    t = 1.0 - (1.0 - t) * (1.0 - t);            // ease-out
+    OverlayFrame((int)(g_ovFrom + (g_ovTo - g_ovFrom) * t));
+}
+
 void MagnifyBeginShrink()
 {
     KillTimer(g_mainWnd, TIMER_MAG_HOLD);
     if (g_magState != MagState::Big) return;
     CancelMagAnimation();
     g_magState = MagState::Shrinking;
+
+    if (g_cur.overlay && OverlayBeginShrink())
+        return;
+
     const LONG gen = InterlockedIncrement(&g_magGen);
     g_magThread = CreateThread(nullptr, 0, MagShrinkThread,
                                (LPVOID)(LONG_PTR)gen, 0, nullptr);
@@ -1188,13 +1351,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == TIMER_MAG_HOLD) MagnifyBeginShrink();
+        if (wp == TIMER_MAG_HOLD)       MagnifyBeginShrink();
+        else if (wp == TIMER_MAG_FRAME) OverlayFrameTick();
         return 0;
 
-    case WMAPP_MAGDONE:   // анімація дійшла до кінця (lp = її покоління)
+    case WMAPP_MAGDONE:   // системний розмір повернуто (lp = покоління анімації)
         if (g_magState == MagState::Shrinking && g_magGen == (LONG)lp) {
             RegDeleteInt(kRegCursorRestore);
-            g_magState = MagState::Idle;
+            if (!g_overlay)          // при оверлеї стан закриє його ж таймер
+                g_magState = MagState::Idle;
         }
         return 0;
 
@@ -1262,6 +1427,12 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 g_cur.enabled = SendMessageW(g_curEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
                 RegSaveInt(kRegCursorEnable, g_cur.enabled ? 1 : 0);
                 ApplyCursorFeature();
+            }
+            return 0;
+        case IDC_CUR_OVERLAY:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_cur.overlay = SendMessageW(g_curOverlay, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                RegSaveInt(kRegCursorOverlay, g_cur.overlay ? 1 : 0);
             }
             return 0;
         case IDC_CUR_ADVANCED:
@@ -1366,7 +1537,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
     RegisterClassW(&wc);
 
-    const int w = sc(470), h = sc(460);
+    WNDCLASSW ov = {};
+    ov.lpfnWndProc   = DefWindowProcW;
+    ov.hInstance     = hInst;
+    ov.lpszClassName = L"capslang_overlay";
+    RegisterClassW(&ov);
+
+    const int w = sc(470), h = sc(520);
     RECT rc = { 0, 0, w, h };
     AdjustWindowRect(&rc, WS_CAPTION | WS_SYSMENU, FALSE);
     HWND hwnd = CreateWindowW(kWndClass, L"capslang", WS_CAPTION | WS_SYSMENU,
@@ -1388,7 +1565,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     // Таб-контрол створюємо ПЕРШИМ: сторінки-діти, створені після нього,
     // опиняються вище за z-order і малюються поверх його полотна.
     g_tabs = CreateWindowW(WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                           sc(12), sc(12), sc(446), sc(380),
+                           sc(12), sc(12), sc(446), sc(440),
                            hwnd, (HMENU)(INT_PTR)IDC_TABS, hInst, nullptr);
     SendMessageW(g_tabs, WM_SETFONT, (WPARAM)font, TRUE);
     TCITEMW tab = {};
@@ -1433,23 +1610,29 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     addC(mk(L"STATIC", L"Не працює в іграх та інших повноекранних програмах.",
             0, 28, 78, 410, 18, IDC_HINT_GRAY));
 
-    addC(mk(L"STATIC", L"Наскільки збільшувати", 0, 28, 106, 260, 20, 0));
-    g_curScaleVal = addC(mk(L"STATIC", L"", SS_RIGHT, 350, 106, 88, 20, 0));
+    addC(mk(L"STATIC", L"Наскільки збільшувати", 0, 28, 110, 260, 20, 0));
+    g_curScaleVal = addC(mk(L"STATIC", L"", SS_RIGHT, 350, 110, 88, 20, 0));
     g_curScale = addC(mk(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS | WS_TABSTOP,
-                         24, 126, 414, 30, IDC_CUR_SCALE));
+                         24, 130, 414, 30, IDC_CUR_SCALE));
     SendMessageW(g_curScale, TBM_SETRANGE, TRUE, MAKELPARAM(2, 8));
     SendMessageW(g_curScale, TBM_SETPOS, TRUE, g_cur.scale);
 
-    addC(mk(L"STATIC", L"Скільки тримати збільшеним", 0, 28, 164, 260, 20, 0));
-    g_curHoldVal = addC(mk(L"STATIC", L"", SS_RIGHT, 350, 164, 88, 20, 0));
+    addC(mk(L"STATIC", L"Скільки тримати збільшеним", 0, 28, 172, 260, 20, 0));
+    g_curHoldVal = addC(mk(L"STATIC", L"", SS_RIGHT, 350, 172, 88, 20, 0));
     g_curHold = addC(mk(TRACKBAR_CLASSW, L"", TBS_AUTOTICKS | WS_TABSTOP,
-                        24, 184, 414, 30, IDC_CUR_HOLD));
+                        24, 192, 414, 30, IDC_CUR_HOLD));
     SendMessageW(g_curHold, TBM_SETRANGE, TRUE, MAKELPARAM(5, 50));
     SendMessageW(g_curHold, TBM_SETPAGESIZE, 0, 5);
     SendMessageW(g_curHold, TBM_SETPOS, TRUE, g_cur.holdMs / 100);
 
+    g_curOverlay = addC(mk(L"BUTTON", L"Зменшувати плавно (намальованою копією)",
+                           BS_AUTOCHECKBOX | WS_TABSTOP, 28, 230, 410, 24, IDC_CUR_OVERLAY));
+    SendMessageW(g_curOverlay, BM_SETCHECK, g_cur.overlay ? BST_CHECKED : BST_UNCHECKED, 0);
+    addC(mk(L"STATIC", L"Інакше зменшує сам системний курсор — помітними стрибками.",
+            0, 28, 256, 410, 18, IDC_HINT_GRAY));
+
     g_curAdvBtn = addC(mk(L"BUTTON", L"Детально ▾", BS_PUSHBUTTON | WS_TABSTOP,
-                          28, 222, 130, 26, IDC_CUR_ADVANCED));
+                          28, 288, 130, 26, IDC_CUR_ADVANCED));
 
     // «Детально»: чутливість жесту. Значення приймаються при втраті фокуса й
     // притискаються до робочого діапазону, щоб не можна було вимкнути фічу
@@ -1463,18 +1646,18 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
         SetWindowTextW(e, buf);
         return e;
     };
-    g_edWindow = advRow(L"Вікно розпізнавання жесту, мс", 258, IDC_CUR_WINDOWMS,  g_cur.windowMs);
-    g_edDist   = advRow(L"Мінімальний шлях миші, px",     284, IDC_CUR_DIST,      g_cur.distance);
-    g_edFactor = advRow(L"Поріг «шлях / розмах», %",      310, IDC_CUR_FACTOR,    g_cur.factor);
-    g_edRevers = advRow(L"Мінімум змін напрямку",         336, IDC_CUR_REVERSALS, g_cur.reversals);
-    g_edShrink = advRow(L"Плавність зменшення, мс",       362, IDC_CUR_SHRINK,    g_cur.shrinkMs);
+    g_edWindow = advRow(L"Вікно розпізнавання жесту, мс", 322, IDC_CUR_WINDOWMS,  g_cur.windowMs);
+    g_edDist   = advRow(L"Мінімальний шлях миші, px",     348, IDC_CUR_DIST,      g_cur.distance);
+    g_edFactor = advRow(L"Поріг «шлях / розмах», %",      374, IDC_CUR_FACTOR,    g_cur.factor);
+    g_edRevers = advRow(L"Мінімум змін напрямку",         400, IDC_CUR_REVERSALS, g_cur.reversals);
+    g_edShrink = advRow(L"Тривалість зменшення, мс",      426, IDC_CUR_SHRINK,    g_cur.shrinkMs);
 
     SetCursorValueLabels();
 
-    mk(L"STATIC", L"© Plum, 2026", 0, 20, 404, 200, 18, IDC_COPYRIGHT);
+    mk(L"STATIC", L"© Plum, 2026", 0, 20, 464, 200, 18, IDC_COPYRIGHT);
 
     // Логотип — поза вкладками, інакше його перекриє полотно таб-контрола
-    SetRect(&g_logoRect, sc(398), sc(396), sc(398 + 48), sc(396 + 48));
+    SetRect(&g_logoRect, sc(398), sc(456), sc(398 + 48), sc(456 + 48));
 
     SelectTab(0);
 
