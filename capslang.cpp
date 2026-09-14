@@ -36,6 +36,10 @@
 #include <commctrl.h>
 #include <taskschd.h>
 #include <gdiplus.h>
+// MinGW затягує їх транзитивно, MSVC — ні: sqrt() у детекторі жесту й _wtoi()
+// у полях «Детально» інакше валять саме релізну збірку, а не локальну.
+#include <math.h>
+#include <stdlib.h>
 
 namespace {
 
