@@ -68,6 +68,7 @@ constexpr int  IDC_MODE_HOTKEY = 103;
 constexpr int  IDC_MODE_HINT   = 104;
 constexpr int  IDC_PASSTHROUGH      = 105;
 constexpr int  IDC_PASSTHROUGH_HINT = 106;
+constexpr int  IDC_LAYOUT_ENABLE    = 107;  // CAPS-9: «Переключати розкладки з Caps Lock»
 // CAPS-2: вкладка «Курсор»
 constexpr int  IDC_TABS          = 110;
 constexpr int  IDC_CUR_ENABLE    = 111;
@@ -111,6 +112,7 @@ const wchar_t* kTaskName = L"capslang";
 const wchar_t* kRegPath  = L"Software\\capslang";
 const wchar_t* kRegMode  = L"Mode";
 const wchar_t* kRegPassthrough = L"PassthroughRemote";
+const wchar_t* kRegLayoutSwitch = L"LayoutSwitch";   // CAPS-9: перемикання розкладок увімкнено (1)
 
 // Два способи перехопити клавішу. Основний тримає Caps Lock вимкненим, але це
 // клавіатурний хук, який деякі захисні програми не люблять; запасний працює
@@ -131,6 +133,12 @@ bool  g_interceptionOn = false;       // перехоплення активне
 bool  g_hotkeyActive   = false;       // RegisterHotKey зараз тримається
 HWINEVENTHOOK g_winEvent = nullptr;
 HWND  g_passthroughCheckbox = nullptr;
+
+// CAPS-9: перемикання розкладок — окрема функція, яку можна вимкнути, не чіпаючи
+// автозапуск (він тепер у вкладці «Налаштування»). Вимкнено = Caps Lock звичайний.
+bool  g_layoutOn = true;
+HWND  g_layoutCheckbox = nullptr;
+HWND  g_pageSettings[16] = {};  int g_pageSettingsN = 0;
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
@@ -1768,6 +1776,7 @@ bool IsPageControl(HWND c)
     for (int i = 0; i < g_advN; ++i)        if (g_advCtrls[i]   == c) return true;
     for (int i = 0; i < g_pageThemeN; ++i)  if (g_pageTheme[i]  == c) return true;
     for (int i = 0; i < g_thAdvN; ++i)      if (g_thAdv[i]      == c) return true;
+    for (int i = 0; i < g_pageSettingsN; ++i) if (g_pageSettings[i] == c) return true;
     return false;
 }
 
@@ -1787,6 +1796,7 @@ void SelectTab(int index)
     ShowGroup(g_advCtrls, g_advN, index == 1 && g_advVisible);
     ShowGroup(g_pageTheme, g_pageThemeN, index == 2);
     ShowGroup(g_thAdv, g_thAdvN, index == 2 && g_thAdvVisible);
+    ShowGroup(g_pageSettings, g_pageSettingsN, index == 3);
 }
 
 void ToggleAdvanced()
@@ -1966,9 +1976,48 @@ void ShowSettings(HWND hwnd)
 
 void UpdateModeHint()
 {
-    SetWindowTextW(g_modeHint, g_mode == Mode::Hook
+    SetWindowTextW(g_modeHint,
+        !g_layoutOn         ? L"Перемикання вимкнено — Caps Lock працює як звичайний Caps Lock."
+        : g_mode == Mode::Hook
         ? L"CapsLock лише перемикає мову й не вмикає великі літери."
         : L"Оберіть, якщо основний режим не працює або конфліктує з іншою програмою.");
+}
+
+// CAPS-9: режим і пропуск у remote мають сенс лише поки перемикання ввімкнено.
+void SetLayoutControlsEnabled(HWND hwnd)
+{
+    EnableWindow(GetDlgItem(hwnd, IDC_MODE_HOOK),   g_layoutOn);
+    EnableWindow(GetDlgItem(hwnd, IDC_MODE_HOTKEY), g_layoutOn);
+    EnableWindow(g_passthroughCheckbox,             g_layoutOn);
+}
+
+// CAPS-9: увімкнути/вимкнути саме перемикання розкладок. Не чіпає автозапуск:
+// програма може стартувати з Windows заради курсора чи дня/ночі, а Caps Lock
+// лишатиметься звичайним.
+void ApplyLayoutSwitch(HWND hwnd, bool on)
+{
+    if (on && !g_interceptionOn) {
+        if (!StartInterception(g_mode)) {
+            const Mode other = (g_mode == Mode::Hook) ? Mode::Hotkey : Mode::Hook;
+            if (StartInterception(other)) {
+                g_mode = other;
+                SaveMode(other);
+            } else {
+                MessageBoxW(hwnd, L"Не вдалося перехопити клавішу CapsLock.",
+                            L"capslang", MB_ICONERROR | MB_OK);
+                on = false;
+            }
+        }
+    } else if (!on && g_interceptionOn) {
+        StopInterception();
+    }
+    g_layoutOn = on;
+    RegSaveInt(kRegLayoutSwitch, on ? 1 : 0);
+    SendMessageW(g_layoutCheckbox, BM_SETCHECK, on ? BST_CHECKED : BST_UNCHECKED, 0);
+    CheckRadioButton(hwnd, IDC_MODE_HOOK, IDC_MODE_HOTKEY,
+                     g_mode == Mode::Hook ? IDC_MODE_HOOK : IDC_MODE_HOTKEY);
+    SetLayoutControlsEnabled(hwnd);
+    UpdateModeHint();
 }
 
 // Перемикання режиму наживо: знімаємо поточний перехоплювач і ставимо інший.
@@ -2133,6 +2182,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                              AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             }
             return 0;
+        case IDC_LAYOUT_ENABLE:   // CAPS-9
+            if (HIWORD(wp) == BN_CLICKED)
+                ApplyLayoutSwitch(hwnd, SendMessageW(g_layoutCheckbox, BM_GETCHECK, 0, 0) == BST_CHECKED);
+            return 0;
         case IDC_MODE_HOOK:
             if (HIWORD(wp) == BN_CLICKED && g_mode != Mode::Hook)
                 ApplyMode(hwnd, Mode::Hook);
@@ -2292,6 +2345,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     InitializeCriticalSection(&g_magLock);
     LoadCursorSettings();
     LoadThemeSettings();   // CAPS-7
+    g_layoutOn = RegLoadInt(kRegLayoutSwitch, 1, 0, 1) != 0;   // CAPS-9
     // Якщо попередній запуск обірвався із збільшеним курсором — повертаємо розмір
     // ДО того, як щось показуємо користувачу.
     RecoverCursorSize();
@@ -2352,18 +2406,22 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     SendMessageW(g_tabs, TCM_INSERTITEMW, 1, (LPARAM)&tab);
     tab.pszText = (LPWSTR)L"День/ніч";
     SendMessageW(g_tabs, TCM_INSERTITEMW, 2, (LPARAM)&tab);
+    tab.pszText = (LPWSTR)L"Налаштування";
+    SendMessageW(g_tabs, TCM_INSERTITEMW, 3, (LPARAM)&tab);
 
     auto addL = [&](HWND c) { g_pageLayout[g_pageLayoutN++] = c; return c; };
     auto addC = [&](HWND c) { g_pageCursor[g_pageCursorN++] = c; return c; };
     auto addA = [&](HWND c) { g_advCtrls[g_advN++] = c; return c; };
     auto addT = [&](HWND c) { g_pageTheme[g_pageThemeN++] = c; return c; };
     auto addTA = [&](HWND c) { g_thAdv[g_thAdvN++] = c; return c; };
+    auto addS = [&](HWND c) { g_pageSettings[g_pageSettingsN++] = c; return c; };
 
     // ---- вкладка «Розкладка» ----
     addL(mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 28, 52, 300, 20, 0));
     addL(mk(L"STATIC", L"Shift + CapsLock — звичайний Caps Lock", 0, 28, 76, 300, 20, 0));
-    g_checkbox = addL(mk(L"BUTTON", L"Запускати при вході в Windows",
-                         BS_AUTOCHECKBOX | WS_TABSTOP, 28, 110, 300, 24, IDC_AUTOSTART));
+    g_layoutCheckbox = addL(mk(L"BUTTON", L"Переключати розкладки з Caps Lock",
+                               BS_AUTOCHECKBOX | WS_TABSTOP, 28, 110, 300, 24, IDC_LAYOUT_ENABLE));
+    SendMessageW(g_layoutCheckbox, BM_SETCHECK, g_layoutOn ? BST_CHECKED : BST_UNCHECKED, 0);
 
     addL(mk(L"STATIC", L"Режим роботи:", 0, 28, 148, 200, 20, 0));
     addL(mk(L"BUTTON", L"Основний", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
@@ -2380,8 +2438,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                  g_passthrough ? BST_CHECKED : BST_UNCHECKED, 0);
     addL(mk(L"STATIC", L"Remote Desktop, Windows App, VMware, Hyper-V.",
             0, 28, 274, 410, 18, IDC_PASSTHROUGH_HINT));
-    addL(mk(L"STATIC", L"Вікно можна закрити — програма лишається в треї.",
-            0, 28, 340, 410, 18, IDC_HINT_GRAY));
+
+    // ---- вкладка «Налаштування» (CAPS-9) ----
+    g_checkbox = addS(mk(L"BUTTON", L"Запускати при вході в Windows",
+                         BS_AUTOCHECKBOX | WS_TABSTOP, 28, 52, 410, 24, IDC_AUTOSTART));
+    addS(mk(L"STATIC", L"Задача Планувальника з найвищими правами, без запиту UAC.",
+            0, 28, 78, 410, 18, IDC_HINT_GRAY));
+    addS(mk(L"STATIC", L"Вікно можна закрити — програма лишається в треї.",
+            0, 28, 112, 410, 18, IDC_HINT_GRAY));
 
     // ---- вкладка «Курсор» ----
     g_curEnable = addC(mk(L"BUTTON", L"Збільшувати курсор, якщо потрусити мишею",
@@ -2535,7 +2599,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     StartHookThread();  // має бути до StartInterception у режимі Hook
     ApplyCursorFeature();  // CAPS-2: мишачий хук на тому ж потоці
     g_mode = LoadMode();
-    if (!StartInterception(g_mode)) {
+    // CAPS-9: перехоплення лише якщо перемикання ввімкнено; інакше програма живе
+    // заради курсора/дня-ночі, а Caps Lock лишається звичайним.
+    if (g_layoutOn && !StartInterception(g_mode)) {
         // збережений режим не піднявся — пробуємо інший, щоб утиліта не була мертвою
         Mode other = (g_mode == Mode::Hook) ? Mode::Hotkey : Mode::Hook;
         if (!StartInterception(other)) {
@@ -2548,6 +2614,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     }
     CheckRadioButton(hwnd, IDC_MODE_HOOK, IDC_MODE_HOTKEY,
                      g_mode == Mode::Hook ? IDC_MODE_HOOK : IDC_MODE_HOTKEY);
+    SetLayoutControlsEnabled(hwnd);
     UpdateModeHint();
 
     MSG msg;
