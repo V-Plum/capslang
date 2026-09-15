@@ -19,7 +19,8 @@ $LIBS = @(
     "shlwapi.lib", "ole32.lib", "oleaut32.lib", "gdiplus.lib", "taskschd.lib",
     "advapi32.lib",  # реєстр: mingw лінкує його сам, MSVC вимагає явно
     "wininet.lib", "version.lib",  # CAPS-7: геолокація за IP, версія з VERSIONINFO
-    "uxtheme.lib", "dwmapi.lib"    # CAPS-8: темна тема вікна
+    "uxtheme.lib", "dwmapi.lib",   # CAPS-8: темна тема вікна
+    "bcrypt.lib"                   # CAPS-10: SHA-256 + ECDSA-перевірка оновлень
 )
 
 function Find-VcVars {
@@ -88,7 +89,7 @@ function Build-Mingw {
     & $gxx capslang.cpp capslang_res.o -o capslang.exe `
         -municode -mwindows -O2 -s -static -fno-exceptions -fno-rtti `
         -lshell32 -lgdi32 -lgdiplus -lshlwapi -lole32 -loleaut32 -lcomctl32 -ltaskschd -luuid -ladvapi32 `
-        -lwininet -lversion -luxtheme -ldwmapi
+        -lwininet -lversion -luxtheme -ldwmapi -lbcrypt
     if ($LASTEXITCODE -ne 0) { throw "compile failed" }
 
     Remove-Item capslang_res.o -ErrorAction SilentlyContinue

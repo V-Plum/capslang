@@ -52,6 +52,9 @@
 #include <dwmapi.h>
 #include <uxtheme.h>
 #include <vsstyle.h>
+// CAPS-10: автооновлення — SHA-256 і перевірка ECDSA-підпису вбудованим BCrypt.
+#include <bcrypt.h>
+#include <vector>
 
 namespace {
 
@@ -61,6 +64,7 @@ constexpr UINT WMAPP_SWITCH       = WM_APP + 3;
 constexpr UINT WMAPP_SHAKE        = WM_APP + 4;   // від мишачого хука: жест розпізнано
 constexpr UINT WMAPP_MAGDONE      = WM_APP + 5;   // потік анімації: зменшення завершено
 constexpr UINT WMAPP_THEMELOC     = WM_APP + 6;   // потік геолокації: lp = LocResult* (heap)
+constexpr UINT WMAPP_UPDATE       = WM_APP + 7;   // потік оновлення: lp = UpdResult* (heap)
 constexpr UINT HKW_INSTALL        = WM_APP + 20;  // до вікна потоку хука
 constexpr UINT HKW_UNINSTALL      = WM_APP + 21;
 constexpr UINT HKW_MOUSE_ON       = WM_APP + 22;
@@ -107,6 +111,12 @@ constexpr int  IDC_TH_NOW        = 145;
 constexpr int  IDC_WT_AUTO       = 150;   // порядок = WinTheme
 constexpr int  IDC_WT_LIGHT      = 151;
 constexpr int  IDC_WT_DARK       = 152;
+// CAPS-10: оновлення (вкладка «Налаштування»)
+constexpr int  IDC_UPD_DAILY     = 160;
+constexpr int  IDC_UPD_STATUS    = 161;
+constexpr int  IDC_UPD_CHECK     = 162;
+constexpr int  IDC_UPD_INSTALL   = 163;
+constexpr int  IDC_UPD_ROLLBACK  = 164;
 constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
 constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
@@ -114,6 +124,7 @@ constexpr UINT IDM_EXIT        = 2;
 constexpr UINT TIMER_MAG_HOLD   = 1;
 constexpr UINT TIMER_MAG_FRAME  = 2;   // кадр оверлейної анімації
 constexpr UINT TIMER_THEME      = 3;   // CAPS-7: перевірка теми раз на хвилину
+constexpr UINT TIMER_UPDATE     = 4;   // CAPS-10: хвилина після старту, далі кожні 30 хв
 
 const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
@@ -122,6 +133,9 @@ const wchar_t* kRegMode  = L"Mode";
 const wchar_t* kRegPassthrough = L"PassthroughRemote";
 const wchar_t* kRegLayoutSwitch = L"LayoutSwitch";   // CAPS-9: перемикання розкладок увімкнено (1)
 const wchar_t* kRegWindowTheme  = L"WindowTheme";    // CAPS-8: 0 авто / 1 світла / 2 темна
+const wchar_t* kRegUpdDaily     = L"UpdateCheckDaily";  // CAPS-10
+const wchar_t* kRegUpdLast      = L"UpdateLastCheck";   // unix (DWORD)
+const wchar_t* kRegUpdNotified  = L"UpdateNotifiedTag"; // REG_SZ: про яку версію вже казали
 
 // Два способи перехопити клавішу. Основний тримає Caps Lock вимкненим, але це
 // клавіатурний хук, який деякі захисні програми не люблять; запасний працює
@@ -170,6 +184,40 @@ constexpr COLORREF kDkThumb  = RGB(204, 204, 204);
 constexpr COLORREF kDkAccent = RGB(96, 165, 250);   // смужка активної вкладки
 HBRUSH g_brDkBg = nullptr, g_brDkPage = nullptr, g_brDkEdit = nullptr;
 HBRUSH g_brDkBorder = nullptr, g_brDkThumb = nullptr, g_brDkAccent = nullptr;
+
+// ---------- CAPS-10: автооновлення з GitHub Releases ----------
+//
+// Перевірка: GET releases/latest → tag_name. Завантаження capslang.exe і
+// capslang.exe.sig з releases/download/<tag>/. Справжність — ECDSA P-256 підпис
+// SHA-256 файлу, зроблений у CI приватним ключем (GitHub Secret CAPSLANG_SIGNING_KEY);
+// публічний ключ зашитий нижче і лежить у репо як capslang_signing_pub.pem — CI
+// перевіряє їх збіг. Підпис Authenticode не потрібен: файл, записаний самою
+// програмою, не має Mark-of-the-Web, SmartScreen мовчить. Заміна: запущений exe →
+// capslang.exe.old, новий на його місце, запуск нового з --after-update <pid>
+// (чекає виходу старого, бо м'ютекс одного екземпляра), старий виходить. .old
+// лишається для «Повернути попередню версію».
+// X||Y публічного ключа (одним літералом — CI звіряє його з capslang_signing_pub.pem)
+const char*    kUpdatePubKeyHex = "86a4bec4e053f5a79786c1f5493c1faebd1f1909b4606616eaf93afc39cd100f821fd2724675adb0721049e70df4cc6130bdc4424b75049b21f31c09e5a065c9";
+const wchar_t* kUpdApiUrl = L"https://api.github.com/repos/V-Plum/capslang/releases/latest";
+const wchar_t* kUpdDlBase = L"https://github.com/V-Plum/capslang/releases/download/";
+
+enum class UpdState { Idle, Checking, UpToDate, Available, Downloading, Verified, Error };
+struct UpdResult {
+    bool    install = false;   // false = лише перевірити
+    bool    manual  = false;   // натиснуто кнопку (без балуна в треї)
+    bool    ok      = false;
+    wchar_t tag[32] = {};
+    wchar_t msg[160] = {};
+};
+bool          g_updDaily = true;
+__time64_t    g_updLast  = 0;
+UpdState      g_updState = UpdState::Idle;
+wchar_t       g_updTag[32] = {};        // доступна версія (tag)
+wchar_t       g_updMsg[160] = {};       // текст помилки
+wchar_t       g_updNotified[32] = {};
+volatile LONG g_updBusy = 0;
+HWND g_updDailyCb = nullptr, g_updStatus = nullptr;
+HWND g_updCheckBtn = nullptr, g_updInstallBtn = nullptr, g_updRollbackBtn = nullptr;
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
@@ -1754,6 +1802,334 @@ void ExeVersionString(wchar_t* buf, size_t n)
     delete[] data;
 }
 
+// ---------- CAPS-10: автооновлення — мережа, крипто, заміна файлу ----------
+
+void ExePath(wchar_t* buf) { GetModuleFileNameW(nullptr, buf, MAX_PATH); }
+
+// HTTPS GET: у пам'ять (toFile == nullptr) або у файл. Редиректи GitHub → CDN WinINet
+// проходить сам. Ліміт пам'яті 4 МБ — API-відповідь і підпис малі.
+bool HttpGet(const wchar_t* url, std::vector<BYTE>& out, const wchar_t* toFile)
+{
+    wchar_t ver[32] = {}, ua[64] = {};
+    ExeVersionString(ver, 32);
+    swprintf(ua, 64, L"capslang/%s", ver);
+    HINTERNET h = InternetOpenW(ua, INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!h) return false;
+    DWORD to = 15000;
+    InternetSetOptionW(h, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof(to));
+    InternetSetOptionW(h, INTERNET_OPTION_SEND_TIMEOUT,    &to, sizeof(to));
+    InternetSetOptionW(h, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof(to));
+    bool ok = false;
+    HINTERNET u = InternetOpenUrlW(h, url, L"Accept: application/vnd.github+json\r\n", (DWORD)-1,
+                                   INTERNET_FLAG_SECURE | INTERNET_FLAG_RELOAD |
+                                   INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
+    if (u) {
+        DWORD status = 0, sz = sizeof(status);
+        HttpQueryInfoW(u, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status, &sz, nullptr);
+        if (status == 200) {
+            HANDLE f = INVALID_HANDLE_VALUE;
+            if (toFile) f = CreateFileW(toFile, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                        FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (!toFile || f != INVALID_HANDLE_VALUE) {
+                ok = true;
+                static BYTE buf[65536];
+                DWORD n = 0;
+                while (InternetReadFile(u, buf, sizeof(buf), &n) && n > 0) {
+                    if (toFile) {
+                        DWORD w = 0;
+                        if (!WriteFile(f, buf, n, &w, nullptr) || w != n) { ok = false; break; }
+                    } else {
+                        out.insert(out.end(), buf, buf + n);
+                        if (out.size() > (4u << 20)) { ok = false; break; }
+                    }
+                }
+                if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+            }
+        }
+        InternetCloseHandle(u);
+    }
+    InternetCloseHandle(h);
+    return ok;
+}
+
+// "v1.6.0" / "1.6.0" → [1,6,0]
+bool ParseVersion(const wchar_t* s, int v[3])
+{
+    if (*s == L'v' || *s == L'V') ++s;
+    for (int i = 0; i < 3; ++i) {
+        wchar_t* end = nullptr;
+        v[i] = (int)wcstol(s, &end, 10);
+        if (end == s) return false;
+        s = end;
+        if (i < 2) { if (*s != L'.') return false; ++s; }
+    }
+    return true;
+}
+
+int CompareVersion(const wchar_t* a, const wchar_t* b)
+{
+    int x[3] = {}, y[3] = {};
+    if (!ParseVersion(a, x) || !ParseVersion(b, y)) return 0;
+    for (int i = 0; i < 3; ++i) if (x[i] != y[i]) return x[i] < y[i] ? -1 : 1;
+    return 0;
+}
+
+// ---- CAPS-10: crypto begin ----
+bool HexToBytes(const char* hex, BYTE* out, size_t n)
+{
+    auto nib = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    for (size_t i = 0; i < n; ++i) {
+        const int hi = nib(hex[2 * i]), lo = nib(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return false;
+        out[i] = (BYTE)((hi << 4) | lo);
+    }
+    return hex[2 * n] == 0;
+}
+
+bool Sha256File(const wchar_t* path, BYTE out[32])
+{
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_HASH_HANDLE hh = nullptr;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) return false;
+    if (BCryptCreateHash(alg, &hh, nullptr, 0, nullptr, 0, 0) == 0) {
+        HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (f != INVALID_HANDLE_VALUE) {
+            static BYTE buf[65536];
+            DWORD n = 0;
+            ok = true;
+            while (ReadFile(f, buf, sizeof(buf), &n, nullptr) && n > 0)
+                if (BCryptHashData(hh, buf, n, 0) != 0) { ok = false; break; }
+            CloseHandle(f);
+            if (ok) ok = BCryptFinishHash(hh, out, 32, 0) == 0;
+        }
+        BCryptDestroyHash(hh);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+
+// DER ECDSA-Sig-Value { r INTEGER, s INTEGER } (так пише openssl) → r||s по 32 байти
+// (так хоче BCryptVerifySignature).
+bool DerSigToRaw(const BYTE* d, size_t n, BYTE raw[64])
+{
+    size_t i = 0;
+    if (n < 8 || d[i++] != 0x30) return false;
+    size_t len = d[i++];
+    if (len & 0x80) { int k = (int)(len & 0x7f); len = 0; while (k-- > 0 && i < n) len = (len << 8) | d[i++]; }
+    for (int part = 0; part < 2; ++part) {
+        if (i + 2 > n || d[i++] != 0x02) return false;
+        size_t l = d[i++];
+        if (l == 0 || i + l > n) return false;
+        const BYTE* p = d + i;
+        size_t take = l;
+        while (take > 32 && *p == 0) { ++p; --take; }   // ASN.1 додає 0x00 перед старшим бітом
+        if (take > 32) return false;
+        memset(raw + part * 32, 0, 32);
+        memcpy(raw + part * 32 + (32 - take), p, take);
+        i += l;
+    }
+    return true;
+}
+
+bool VerifySignature(const BYTE hash[32], const BYTE* der, size_t derLen)
+{
+    BYTE raw[64], pub[64];
+    if (!DerSigToRaw(der, derLen, raw) || !HexToBytes(kUpdatePubKeyHex, pub, 64)) return false;
+    struct { BCRYPT_ECCKEY_BLOB h; BYTE xy[64]; } blob;
+    blob.h.dwMagic = BCRYPT_ECDSA_PUBLIC_P256_MAGIC;
+    blob.h.cbKey   = 32;
+    memcpy(blob.xy, pub, 64);
+    BCRYPT_ALG_HANDLE alg = nullptr;
+    BCRYPT_KEY_HANDLE key = nullptr;
+    bool ok = false;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_ECDSA_P256_ALGORITHM, nullptr, 0) != 0) return false;
+    if (BCryptImportKeyPair(alg, nullptr, BCRYPT_ECCPUBLIC_BLOB, &key, (PUCHAR)&blob, sizeof(blob), 0) == 0) {
+        ok = BCryptVerifySignature(key, nullptr, (PUCHAR)hash, 32, raw, 64, 0) == 0;
+        BCryptDestroyKey(key);
+    }
+    BCryptCloseAlgorithmProvider(alg, 0);
+    return ok;
+}
+// ---- CAPS-10: crypto end ----
+
+// Робота потоку: перевірити, а за r->install — ще й завантажити та перевірити підпис.
+void UpdateWork(UpdResult* r)
+{
+    std::vector<BYTE> body;
+    if (!HttpGet(kUpdApiUrl, body, nullptr)) {
+        lstrcpyW(r->msg, L"Не вдалося перевірити оновлення — немає зв'язку з GitHub.");
+        return;
+    }
+    body.push_back(0);
+    const char* s = strstr((const char*)body.data(), "\"tag_name\":\"");
+    if (!s) { lstrcpyW(r->msg, L"GitHub відповів несподівано."); return; }
+    s += 12;
+    int k = 0;
+    while (s[k] && s[k] != '"' && k < 30) { r->tag[k] = (wchar_t)s[k]; ++k; }
+    r->tag[k] = 0;
+    int v[3];
+    if (!ParseVersion(r->tag, v)) { lstrcpyW(r->msg, L"Незрозумілий номер версії у релізі."); return; }
+    if (!r->install) { r->ok = true; return; }
+
+    wchar_t exe[MAX_PATH] = {}, nw[MAX_PATH + 8] = {}, url[256] = {};
+    ExePath(exe);
+    swprintf(nw, MAX_PATH + 8, L"%s.new", exe);
+    swprintf(url, 256, L"%s%s/capslang.exe", kUpdDlBase, r->tag);
+    std::vector<BYTE> sink;
+    if (!HttpGet(url, sink, nw)) {
+        lstrcpyW(r->msg, L"Не вдалося завантажити оновлення.");
+        DeleteFileW(nw);
+        return;
+    }
+    swprintf(url, 256, L"%s%s/capslang.exe.sig", kUpdDlBase, r->tag);
+    std::vector<BYTE> sig;
+    if (!HttpGet(url, sig, nullptr) || sig.size() < 8) {
+        lstrcpyW(r->msg, L"Не вдалося завантажити підпис релізу.");
+        DeleteFileW(nw);
+        return;
+    }
+    BYTE hash[32] = {};
+    if (!Sha256File(nw, hash) || !VerifySignature(hash, sig.data(), sig.size())) {
+        lstrcpyW(r->msg, L"Підпис не збігається — оновлення відхилено.");
+        DeleteFileW(nw);
+        return;
+    }
+    // Здоровий глузд: це Windows-exe розумного розміру
+    HANDLE f = CreateFileW(nw, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    bool looksExe = false;
+    if (f != INVALID_HANDLE_VALUE) {
+        BYTE mz[2] = {}; DWORD n = 0;
+        LARGE_INTEGER size = {};
+        GetFileSizeEx(f, &size);
+        looksExe = ReadFile(f, mz, 2, &n, nullptr) && n == 2 && mz[0] == 'M' && mz[1] == 'Z'
+                && size.QuadPart > 100 * 1024 && size.QuadPart < (32ll << 20);
+        CloseHandle(f);
+    }
+    if (!looksExe) { lstrcpyW(r->msg, L"Завантажений файл не схожий на програму."); DeleteFileW(nw); return; }
+    r->ok = true;
+}
+
+DWORD WINAPI UpdateThread(LPVOID p)
+{
+    UpdResult* r = (UpdResult*)p;
+    UpdateWork(r);
+    PostMessageW(g_mainWnd, WMAPP_UPDATE, 0, (LPARAM)r);
+    return 0;
+}
+
+void UpdateUpdStatus();   // UI, нижче
+
+void StartUpdate(bool install, bool manual)
+{
+    if (InterlockedCompareExchange(&g_updBusy, 1, 0) != 0) return;
+    UpdResult* r = new UpdResult;
+    r->install = install;
+    r->manual  = manual;
+    g_updState = install ? UpdState::Downloading : UpdState::Checking;
+    UpdateUpdStatus();
+    HANDLE t = CreateThread(nullptr, 0, UpdateThread, r, 0, nullptr);
+    if (!t) { delete r; g_updBusy = 0; g_updState = UpdState::Idle; UpdateUpdStatus(); return; }
+    CloseHandle(t);
+}
+
+bool OldVersionExists()
+{
+    wchar_t exe[MAX_PATH] = {}, old[MAX_PATH + 8] = {};
+    ExePath(exe);
+    swprintf(old, MAX_PATH + 8, L"%s.old", exe);
+    return GetFileAttributesW(old) != INVALID_FILE_ATTRIBUTES;
+}
+
+// Запустити exe (той самий шлях, уже нову/повернуту версію) і штатно вийти.
+// Новий процес чекає нашого виходу (--after-update <pid>), бо м'ютекс одного екземпляра.
+bool RelaunchAndExit()
+{
+    wchar_t exe[MAX_PATH] = {}, cmd[MAX_PATH + 64] = {};
+    ExePath(exe);
+    swprintf(cmd, MAX_PATH + 64, L"\"%s\" --after-update %lu", exe, (unsigned long)GetCurrentProcessId());
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    if (!CreateProcessW(exe, cmd, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) return false;
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    DestroyWindow(g_mainWnd);   // штатний вихід: курсор відновиться, хуки знімуться
+    return true;
+}
+
+void ApplyDownloadedUpdate()
+{
+    wchar_t exe[MAX_PATH] = {}, old[MAX_PATH + 8] = {}, nw[MAX_PATH + 8] = {};
+    ExePath(exe);
+    swprintf(old, MAX_PATH + 8, L"%s.old", exe);
+    swprintf(nw,  MAX_PATH + 8, L"%s.new", exe);
+    DeleteFileW(old);
+    if (!MoveFileExW(exe, old, MOVEFILE_REPLACE_EXISTING)) {
+        g_updState = UpdState::Error;
+        lstrcpyW(g_updMsg, L"Не вдалося замінити файл програми.");
+        DeleteFileW(nw);
+        return;
+    }
+    if (!MoveFileExW(nw, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);
+        g_updState = UpdState::Error;
+        lstrcpyW(g_updMsg, L"Не вдалося записати нову версію.");
+        return;
+    }
+    if (!RelaunchAndExit()) {
+        MoveFileExW(exe, nw, MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);
+        DeleteFileW(nw);
+        g_updState = UpdState::Error;
+        lstrcpyW(g_updMsg, L"Не вдалося запустити нову версію — повернуто стару.");
+    }
+}
+
+void RollbackUpdate()
+{
+    wchar_t exe[MAX_PATH] = {}, old[MAX_PATH + 8] = {}, tmp[MAX_PATH + 8] = {};
+    ExePath(exe);
+    swprintf(old, MAX_PATH + 8, L"%s.old", exe);
+    swprintf(tmp, MAX_PATH + 8, L"%s.tmp", exe);
+    if (GetFileAttributesW(old) == INVALID_FILE_ATTRIBUTES) return;
+    if (!MoveFileExW(exe, tmp, MOVEFILE_REPLACE_EXISTING)) return;
+    if (!MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING)) { MoveFileExW(tmp, exe, MOVEFILE_REPLACE_EXISTING); return; }
+    MoveFileExW(tmp, old, MOVEFILE_REPLACE_EXISTING);   // теперішня стає .old — можна повернутись
+    if (!RelaunchAndExit()) {
+        MoveFileExW(exe, tmp, MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(old, exe, MOVEFILE_REPLACE_EXISTING);
+        MoveFileExW(tmp, old, MOVEFILE_REPLACE_EXISTING);
+    }
+}
+
+void TrayBalloon(const wchar_t* title, const wchar_t* text)
+{
+    NOTIFYICONDATAW n = g_nid;
+    n.uFlags = NIF_INFO;
+    n.dwInfoFlags = NIIF_INFO;
+    lstrcpynW(n.szInfoTitle, title, 64);
+    lstrcpynW(n.szInfo, text, 256);
+    Shell_NotifyIconW(NIM_MODIFY, &n);
+}
+
+// --after-update <pid>: зачекати, поки попередній екземпляр вийде (м'ютекс).
+void WaitForPreviousInstance()
+{
+    const wchar_t* p = wcsstr(GetCommandLineW(), L"--after-update ");
+    if (!p) return;
+    const DWORD pid = (DWORD)wcstoul(p + 15, nullptr, 10);
+    if (!pid) return;
+    if (HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, pid)) {
+        WaitForSingleObject(h, 15000);
+        CloseHandle(h);
+    }
+}
+
 // ---------- CAPS-2: вкладки ----------
 
 // Полотно сторінки таб-контрол сам НЕ малює: він малює заголовки й рамку, а
@@ -2122,6 +2498,37 @@ void CommitManualCoords()
     UpdateThemeStatus();
 }
 
+// ---------- CAPS-10: UI оновлень ----------
+
+void FormatDateTime(wchar_t* buf, size_t n, __time64_t t)
+{
+    struct tm lt = {};
+    _localtime64_s(&lt, &t);
+    swprintf(buf, n, L"%02d.%02d %02d:%02d", lt.tm_mday, lt.tm_mon + 1, lt.tm_hour, lt.tm_min);
+}
+
+void UpdateUpdStatus()
+{
+    wchar_t cur[32] = {}, when[32] = L"ще не перевірялось", line[256] = {};
+    ExeVersionString(cur, 32);
+    if (g_updLast) FormatDateTime(when, 32, g_updLast);
+    const wchar_t* avail = (g_updTag[0] == L'v') ? g_updTag + 1 : g_updTag;
+    switch (g_updState) {
+    case UpdState::Checking:    lstrcpyW(line, L"Перевіряю…"); break;
+    case UpdState::UpToDate:    swprintf(line, 256, L"Версія %s — остання. Перевірено %s.", cur, when); break;
+    case UpdState::Available:   swprintf(line, 256, L"Доступна версія %s (у вас %s). Натисніть «Оновити».", avail, cur); break;
+    case UpdState::Downloading: swprintf(line, 256, L"Завантажую %s і перевіряю підпис…", avail); break;
+    case UpdState::Verified:    lstrcpyW(line, L"Підпис підтверджено — перезапускаюсь у новій версії…"); break;
+    case UpdState::Error:       lstrcpynW(line, g_updMsg, 256); break;
+    default:                    swprintf(line, 256, L"Версія %s. Остання перевірка: %s.", cur, when); break;
+    }
+    SetWindowTextW(g_updStatus, line);
+    const bool busy = g_updBusy != 0;
+    EnableWindow(g_updCheckBtn,    !busy);
+    EnableWindow(g_updInstallBtn,  !busy && g_updState == UpdState::Available);
+    EnableWindow(g_updRollbackBtn, !busy && OldVersionExists());
+}
+
 void ThemeApplySettings()
 {
     SaveThemeSettings();
@@ -2284,7 +2691,46 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == TIMER_MAG_HOLD)       MagnifyBeginShrink();
         else if (wp == TIMER_MAG_FRAME) OverlayFrameTick();
         else if (wp == TIMER_THEME)     ThemeTick();
+        else if (wp == TIMER_UPDATE) {  // CAPS-10: хвилина після старту, далі кожні 30 хв
+            SetTimer(hwnd, TIMER_UPDATE, 30 * 60 * 1000, nullptr);
+            if (g_updDaily && NowUnix() - g_updLast > 86400) StartUpdate(false, false);
+        }
         return 0;
+
+    case WMAPP_UPDATE: {   // CAPS-10: потік оновлення завершився
+        UpdResult* r = (UpdResult*)lp;
+        g_updBusy = 0;
+        if (!r->ok) {
+            g_updState = UpdState::Error;
+            lstrcpynW(g_updMsg, r->msg, 160);   // .new при збої прибирає сам потік
+        } else if (!r->install) {
+            g_updLast = NowUnix();
+            RegSaveInt(kRegUpdLast, (int)(DWORD)g_updLast);
+            wchar_t cur[32] = {};
+            ExeVersionString(cur, 32);
+            if (CompareVersion(r->tag, cur) > 0) {
+                lstrcpynW(g_updTag, r->tag, 32);
+                g_updState = UpdState::Available;
+                if (!r->manual && lstrcmpW(g_updNotified, r->tag) != 0) {
+                    wchar_t text[128] = {};
+                    swprintf(text, 128, L"Доступна версія %s. Оновити можна у «Налаштуваннях».",
+                             r->tag[0] == L'v' ? r->tag + 1 : r->tag);
+                    TrayBalloon(L"capslang", text);
+                    lstrcpynW(g_updNotified, r->tag, 32);
+                    RegSaveStr(kRegUpdNotified, r->tag);
+                }
+            } else {
+                g_updState = UpdState::UpToDate;
+            }
+        } else {
+            g_updState = UpdState::Verified;
+            UpdateUpdStatus();
+            ApplyDownloadedUpdate();   // при успіху процес завершується
+        }
+        UpdateUpdStatus();
+        delete r;
+        return 0;
+    }
 
     case WMAPP_THEMELOC: {   // CAPS-7: потік геолокації завершився
         LocResult* r = (LocResult*)lp;
@@ -2402,6 +2848,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SendMessageW(g_checkbox, BM_SETCHECK,
                              AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
             }
+            return 0;
+        case IDC_UPD_DAILY:       // CAPS-10
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_updDaily = SendMessageW(g_updDailyCb, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                RegSaveInt(kRegUpdDaily, g_updDaily ? 1 : 0);
+            }
+            return 0;
+        case IDC_UPD_CHECK:
+            if (HIWORD(wp) == BN_CLICKED) StartUpdate(false, true);
+            return 0;
+        case IDC_UPD_INSTALL:
+            if (HIWORD(wp) == BN_CLICKED && g_updState == UpdState::Available) StartUpdate(true, true);
+            return 0;
+        case IDC_UPD_ROLLBACK:
+            if (HIWORD(wp) == BN_CLICKED &&
+                MessageBoxW(hwnd, L"Повернути попередню версію і перезапустити capslang?",
+                            L"capslang", MB_ICONQUESTION | MB_YESNO) == IDYES)
+                RollbackUpdate();
             return 0;
         case IDC_WT_AUTO:         // CAPS-8
         case IDC_WT_LIGHT:
@@ -2595,6 +3059,7 @@ HFONT CreateUIFont()
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 {
+    WaitForPreviousInstance();   // CAPS-10: після оновлення — дочекатись виходу старого
     CreateMutexW(nullptr, TRUE, L"capslang_single_instance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         // Другий запуск — показуємо вікно першого екземпляра
@@ -2617,6 +3082,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     LoadThemeSettings();   // CAPS-7
     g_layoutOn = RegLoadInt(kRegLayoutSwitch, 1, 0, 1) != 0;   // CAPS-9
     g_winTheme = (WinTheme)RegLoadInt(kRegWindowTheme, 0, 0, 2); // CAPS-8
+    g_updDaily = RegLoadInt(kRegUpdDaily, 1, 0, 1) != 0;          // CAPS-10
+    g_updLast  = (DWORD)RegLoadInt(kRegUpdLast, 0, INT_MIN, INT_MAX);
+    RegLoadStr(kRegUpdNotified, g_updNotified, 32);
+    {   // недокачаний файл від обірваного оновлення — прибрати
+        wchar_t exe[MAX_PATH] = {}, nw[MAX_PATH + 8] = {};
+        ExePath(exe);
+        swprintf(nw, MAX_PATH + 8, L"%s.new", exe);
+        DeleteFileW(nw);
+    }
     // Якщо попередній запуск обірвався із збільшеним курсором — повертаємо розмір
     // ДО того, як щось показуємо користувачу.
     RecoverCursorSize();
@@ -2729,6 +3203,21 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     CheckRadioButton(hwnd, IDC_WT_AUTO, IDC_WT_DARK, IDC_WT_AUTO + (int)g_winTheme);
     addS(mk(L"STATIC", L"«Автоматично» — як тема застосунків Windows (див. «День/ніч»).",
             0, 28, 198, 410, 18, IDC_HINT_GRAY));
+    // CAPS-10: оновлення
+    g_updDailyCb = addS(mk(L"BUTTON", L"Щоденна перевірка оновлень", BS_AUTOCHECKBOX | WS_TABSTOP,
+                           28, 236, 410, 24, IDC_UPD_DAILY));
+    SendMessageW(g_updDailyCb, BM_SETCHECK, g_updDaily ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_updStatus = addS(mk(L"STATIC", L"", 0, 28, 264, 410, 36, IDC_UPD_STATUS));
+    g_updCheckBtn    = addS(mk(L"BUTTON", L"Перевірити зараз", BS_PUSHBUTTON | WS_TABSTOP,
+                              28, 304, 140, 26, IDC_UPD_CHECK));
+    g_updInstallBtn  = addS(mk(L"BUTTON", L"Оновити", BS_PUSHBUTTON | WS_TABSTOP,
+                              178, 304, 110, 26, IDC_UPD_INSTALL));
+    g_updRollbackBtn = addS(mk(L"BUTTON", L"Повернути попередню", BS_PUSHBUTTON | WS_TABSTOP,
+                              298, 304, 140, 26, IDC_UPD_ROLLBACK));
+    addS(mk(L"STATIC", L"Оновлення з GitHub Releases; підпис релізу перевіряється перед заміною. "
+                       L"Попередня версія лишається поруч як capslang.exe.old.",
+            0, 28, 338, 410, 34, IDC_HINT_GRAY));
+    UpdateUpdStatus();
 
     // ---- вкладка «Курсор» ----
     g_curEnable = addC(mk(L"BUTTON", L"Збільшувати курсор, якщо потрусити мишею",
@@ -2873,6 +3362,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     g_mainWnd = hwnd;
     ApplyWindowTheme(true);   // CAPS-8: тема вікна до першого показу
+    SetTimer(hwnd, TIMER_UPDATE, 60 * 1000, nullptr);   // CAPS-10: перша перевірка за хвилину
 
     // CAPS-7: одразу привести тему до часу доби; координати — з кешу, свіжі у фоні.
     EnableThemeControls();
