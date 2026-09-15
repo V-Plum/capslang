@@ -1717,6 +1717,41 @@ void ExeVersionString(wchar_t* buf, size_t n)
 
 // ---------- CAPS-2: вкладки ----------
 
+// Полотно сторінки таб-контрол сам НЕ малює: він малює заголовки й рамку, а
+// всередині просвічує фон батьківського вікна (колір діалогу). Контроли сторінок
+// при цьому отримують COLOR_WINDOW (див. WM_CTLCOLORSTATIC) — власник побачив
+// білі плашки на сірому (CAPS-7). Тому полотно малюємо самі: смуга із
+// заголовками — колір діалогу, область сторінки — колір вікна, як у системних
+// property sheet. Так вигляд не залежить від того, що і як малює тема.
+LRESULT CALLBACK TabSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)
+{
+    if (msg == WM_ERASEBKGND) {
+        HDC dc = (HDC)wp;
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+        RECT page = rc;
+        SendMessageW(h, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);   // область сторінки без рамки
+        FillRect(dc, &page, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
+    if (msg == WM_PAINT) {
+        // Тема може зафарбувати панель по-своєму ПІСЛЯ erase — тому полотно
+        // домальовуємо після стандартного малювання. DCX_CLIPSIBLINGS: контроли
+        // сторінок — сусіди таба вище за z-order, їх не зачіпаємо.
+        const LRESULT r = DefSubclassProc(h, msg, wp, lp);
+        RECT page;
+        GetClientRect(h, &page);
+        SendMessageW(h, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);
+        if (HDC dc = GetDCEx(h, nullptr, DCX_CACHE | DCX_CLIPSIBLINGS)) {
+            FillRect(dc, &page, GetSysColorBrush(COLOR_WINDOW));
+            ReleaseDC(h, dc);
+        }
+        return r;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
 void ShowGroup(HWND* items, int n, bool show)
 {
     for (int i = 0; i < n; ++i)
@@ -2308,6 +2343,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                            sc(12), sc(12), sc(446), sc(440),
                            hwnd, (HMENU)(INT_PTR)IDC_TABS, hInst, nullptr);
     SendMessageW(g_tabs, WM_SETFONT, (WPARAM)font, TRUE);
+    SetWindowSubclass(g_tabs, TabSubclassProc, 1, 0);   // полотно сторінки — див. TabSubclassProc
     TCITEMW tab = {};
     tab.mask = TCIF_TEXT;
     tab.pszText = (LPWSTR)L"Розкладка";
@@ -2428,12 +2464,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                          28, 310, 130, 26, IDC_TH_ADVANCED));
 
     // «Детально»: звідки брати розташування для сходу/заходу
-    addTA(mk(L"STATIC", L"Розташування для сходу/заходу:", 0, 28, 346, 410, 18, 0));
+    addTA(mk(L"STATIC", L"Розташування для сходу/заходу:", 0, 28, 340, 410, 18, 0));
     {
         const wchar_t* names[5] = { L"Автоматично", L"Служба Windows", L"За IP-адресою",
                                     L"Вручну", L"Часовий пояс і регіон" };
         const int xs[5] = { 28, 150, 290, 28, 150 };
-        const int ys[5] = { 366, 366, 366, 388, 388 };
+        const int ys[5] = { 358, 358, 358, 378, 378 };
         const int ws[5] = { 116, 134, 148, 116, 210 };
         for (int i = 0; i < 5; ++i)
             g_thSrc[i] = addTA(mk(L"BUTTON", names[i],
@@ -2441,10 +2477,12 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                 xs[i], ys[i], ws[i], 20, IDC_TH_SRC_AUTO + i));
         CheckRadioButton(hwnd, IDC_TH_SRC_AUTO, IDC_TH_SRC_TZ, IDC_TH_SRC_AUTO + (int)g_th.src);
     }
-    addTA(mk(L"STATIC", L"Широта", 0, 28, 416, 60, 18, 0));
-    g_thLat = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 92, 413, 90, 22, IDC_TH_LAT));
-    addTA(mk(L"STATIC", L"Довгота", 0, 200, 416, 64, 18, 0));
-    g_thLon = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 268, 413, 90, 22, IDC_TH_LON));
+    addTA(mk(L"STATIC", L"Широта", 0, 28, 403, 60, 18, 0));
+    g_thLat = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 92, 400, 90, 22, IDC_TH_LAT));
+    addTA(mk(L"STATIC", L"Довгота", 0, 200, 403, 64, 18, 0));
+    g_thLon = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 268, 400, 90, 22, IDC_TH_LON));
+    addTA(mk(L"STATIC", L"За IP-адресою під VPN покаже розташування VPN-сервера.",
+             0, 28, 427, 410, 18, IDC_HINT_GRAY));
     if (g_th.hasManual) {
         wchar_t b[32];
         swprintf(b, 32, L"%.4f", g_th.lat); SetWindowTextW(g_thLat, b);
