@@ -2658,7 +2658,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     // Таб-контрол створюємо ПЕРШИМ: сторінки-діти, створені після нього,
     // опиняються вище за z-order і малюються поверх його полотна.
-    g_tabs = CreateWindowW(WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
+    // WS_CLIPSIBLINGS обов'язковий: контроли сторінок — сусіди таба вище за
+    // z-order, і без нього будь-яке перемальовування самого таба (наведення на
+    // заголовок) зафарбовує їх нашим полотном — «порожнє вікно» у v1.5.0.
+    g_tabs = CreateWindowW(WC_TABCONTROLW, L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_CLIPSIBLINGS,
                            sc(12), sc(12), sc(446), sc(440),
                            hwnd, (HMENU)(INT_PTR)IDC_TABS, hInst, nullptr);
     SendMessageW(g_tabs, WM_SETFONT, (WPARAM)font, TRUE);
