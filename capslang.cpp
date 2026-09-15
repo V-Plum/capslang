@@ -1900,6 +1900,12 @@ BOOL CALLBACK ThemeChildProc(HWND h, LPARAM)
         SetWindowTheme(h, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
     else if (!lstrcmpiW(cls, L"Edit"))
         SetWindowTheme(h, g_dark ? L"DarkMode_CFD" : nullptr, nullptr);
+    // Повзунок (та інші контроли comctl32) тримає власний кеш зображення і на
+    // WM_PAINT лише бліттить його — RedrawWindow нічого не міняє (власник: після
+    // перемикання теми трекбари лишались у старих кольорах). Перебудувати кеш
+    // змушує WM_THEMECHANGED; далі — явне перемальовування з очищенням.
+    SendMessageW(h, WM_THEMECHANGED, 0, 0);
+    RedrawWindow(h, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_UPDATENOW);
     return TRUE;
 }
 
