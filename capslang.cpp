@@ -48,6 +48,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <limits.h>
+// CAPS-8: темна тема самого вікна — DWM-заголовок, тема контролів, гліфи чекбоксів.
+#include <dwmapi.h>
+#include <uxtheme.h>
+#include <vsstyle.h>
 
 namespace {
 
@@ -99,6 +103,10 @@ constexpr int  IDC_TH_LAT        = 142;
 constexpr int  IDC_TH_LON        = 143;
 constexpr int  IDC_TH_STATUS     = 144;
 constexpr int  IDC_TH_NOW        = 145;
+// CAPS-8: тема вікна (вкладка «Налаштування»)
+constexpr int  IDC_WT_AUTO       = 150;   // порядок = WinTheme
+constexpr int  IDC_WT_LIGHT      = 151;
+constexpr int  IDC_WT_DARK       = 152;
 constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
 constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
@@ -113,6 +121,7 @@ const wchar_t* kRegPath  = L"Software\\capslang";
 const wchar_t* kRegMode  = L"Mode";
 const wchar_t* kRegPassthrough = L"PassthroughRemote";
 const wchar_t* kRegLayoutSwitch = L"LayoutSwitch";   // CAPS-9: перемикання розкладок увімкнено (1)
+const wchar_t* kRegWindowTheme  = L"WindowTheme";    // CAPS-8: 0 авто / 1 світла / 2 темна
 
 // Два способи перехопити клавішу. Основний тримає Caps Lock вимкненим, але це
 // клавіатурний хук, який деякі захисні програми не люблять; запасний працює
@@ -139,6 +148,28 @@ HWND  g_passthroughCheckbox = nullptr;
 bool  g_layoutOn = true;
 HWND  g_layoutCheckbox = nullptr;
 HWND  g_pageSettings[16] = {};  int g_pageSettingsN = 0;
+
+// ---------- CAPS-8: тема самого вікна ----------
+//
+// Windows дає темними лише заголовок (DWM) і кілька контролів через недокументовану
+// тему «DarkMode_Explorer» (кнопки, up-down) та «DarkMode_CFD» (поля вводу). Решту —
+// фон вікна, полотно вкладок і самі вкладки, чекбокси/радіо, повзунки, пікери часу —
+// малюємо самі (той самий шлях, що в Notepad++). «Автоматично» = слідувати за темою
+// застосунків Windows (AppsUseLightTheme), зміни ловимо через WM_SETTINGCHANGE
+// "ImmersiveColorSet" — його ж ми самі й розсилаємо у «День/ніч».
+enum class WinTheme { Auto = 0, Light = 1, Dark = 2 };
+WinTheme g_winTheme = WinTheme::Auto;
+bool     g_dark = false;                 // що зараз застосовано
+constexpr COLORREF kDkBg     = RGB(32, 32, 32);     // фон вікна
+constexpr COLORREF kDkPage   = RGB(43, 43, 43);     // полотно сторінки
+constexpr COLORREF kDkEdit   = RGB(25, 25, 25);     // поля вводу / пікери
+constexpr COLORREF kDkBorder = RGB(82, 82, 82);
+constexpr COLORREF kDkText   = RGB(240, 240, 240);
+constexpr COLORREF kDkGray   = RGB(160, 160, 160);
+constexpr COLORREF kDkThumb  = RGB(204, 204, 204);
+constexpr COLORREF kDkAccent = RGB(96, 165, 250);   // смужка активної вкладки
+HBRUSH g_brDkBg = nullptr, g_brDkPage = nullptr, g_brDkEdit = nullptr;
+HBRUSH g_brDkBorder = nullptr, g_brDkThumb = nullptr, g_brDkAccent = nullptr;
 
 ULONG_PTR g_gdiplusToken = 0;
 Gdiplus::Image* g_logo = nullptr;
@@ -1731,17 +1762,182 @@ void ExeVersionString(wchar_t* buf, size_t n)
 // білі плашки на сірому (CAPS-7). Тому полотно малюємо самі: смуга із
 // заголовками — колір діалогу, область сторінки — колір вікна, як у системних
 // property sheet. Так вигляд не залежить від того, що і як малює тема.
+// ---- CAPS-8: темний режим — власне малювання ----
+
+bool ThemeIsDark();        // CAPS-7, нижче
+bool IsPageControl(HWND c); // нижче, у розділі вкладок
+
+bool ComputeDark()
+{
+    switch (g_winTheme) {
+    case WinTheme::Light: return false;
+    case WinTheme::Dark:  return true;
+    default:              return ThemeIsDark();   // як застосунки Windows
+    }
+}
+
+bool IsCheckOrRadio(HWND h)
+{
+    const LONG t = GetWindowLongW(h, GWL_STYLE) & BS_TYPEMASK;
+    return t == BS_AUTOCHECKBOX || t == BS_CHECKBOX || t == BS_AUTORADIOBUTTON || t == BS_RADIOBUTTON;
+}
+
+// Чекбокс/радіо в темному режимі: тема малює гліф (з «DarkMode_Explorer» — темний),
+// текст малюємо самі, бо теми-кнопки ігнорують колір із WM_CTLCOLORSTATIC.
+void DrawCheckDark(HWND h, HDC dc, RECT rc)
+{
+    FillRect(dc, &rc, IsPageControl(h) ? g_brDkPage : g_brDkBg);
+    const LONG st = GetWindowLongW(h, GWL_STYLE);
+    const LONG type = st & BS_TYPEMASK;
+    const bool radio = (type == BS_AUTORADIOBUTTON || type == BS_RADIOBUTTON);
+    const bool checked = SendMessageW(h, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const bool enabled = IsWindowEnabled(h) != FALSE;
+    const int part  = radio ? BP_RADIOBUTTON : BP_CHECKBOX;
+    const int state = checked ? (enabled ? CBS_CHECKEDNORMAL : CBS_CHECKEDDISABLED)
+                              : (enabled ? CBS_UNCHECKEDNORMAL : CBS_UNCHECKEDDISABLED);
+    const UINT dpi = GetDpiForSystem();
+    SIZE sz = { MulDiv(13, dpi, 96), MulDiv(13, dpi, 96) };
+    HTHEME th = OpenThemeData(h, L"Button");
+    if (th) GetThemePartSize(th, dc, part, state, nullptr, TS_TRUE, &sz);
+    RECT box = { rc.left, (rc.top + rc.bottom - sz.cy) / 2, rc.left + sz.cx, (rc.top + rc.bottom + sz.cy) / 2 };
+    if (th) { DrawThemeBackground(th, dc, part, state, &box, nullptr); CloseThemeData(th); }
+    else    { FrameRect(dc, &box, g_brDkThumb); }
+
+    wchar_t text[256] = {};
+    GetWindowTextW(h, text, 255);
+    HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, enabled ? kDkText : kDkGray);
+    RECT tr = rc;
+    tr.left = box.right + MulDiv(5, dpi, 96);
+    if (st & BS_MULTILINE) {
+        RECT calc = tr;
+        DrawTextW(dc, text, -1, &calc, DT_WORDBREAK | DT_CALCRECT);
+        const int hgt = calc.bottom - calc.top;
+        tr.top = (rc.top + rc.bottom - hgt) / 2;
+        DrawTextW(dc, text, -1, &tr, DT_WORDBREAK);
+    } else {
+        DrawTextW(dc, text, -1, &tr, DT_SINGLELINE | DT_VCENTER);
+    }
+    SelectObject(dc, old);
+}
+
+// Таб-контрол у темному режимі малюємо повністю: тема вміє лише світлий.
+void PaintTabDark(HWND h)
+{
+    PAINTSTRUCT ps;
+    HDC dc = BeginPaint(h, &ps);
+    RECT rc;
+    GetClientRect(h, &rc);
+    FillRect(dc, &rc, g_brDkBg);
+    RECT page = rc;
+    SendMessageW(h, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);
+    RECT frame = page;
+    InflateRect(&frame, 2, 2);
+    FillRect(dc, &frame, g_brDkPage);
+    FrameRect(dc, &frame, g_brDkBorder);
+
+    const int n   = (int)SendMessageW(h, TCM_GETITEMCOUNT, 0, 0);
+    const int sel = (int)SendMessageW(h, TCM_GETCURSEL, 0, 0);
+    HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+    SetBkMode(dc, TRANSPARENT);
+    for (int i = 0; i < n; ++i) {
+        RECT ir;
+        SendMessageW(h, TCM_GETITEMRECT, i, (LPARAM)&ir);
+        wchar_t text[64] = {};
+        TCITEMW it = {};
+        it.mask = TCIF_TEXT; it.pszText = text; it.cchTextMax = 63;
+        SendMessageW(h, TCM_GETITEMW, i, (LPARAM)&it);
+        if (i == sel) {
+            RECT fill = ir;
+            fill.bottom = frame.top + 1;             // зливається зі сторінкою
+            FillRect(dc, &fill, g_brDkPage);
+            RECT line = ir;
+            line.bottom = line.top + 2;
+            FillRect(dc, &line, g_brDkAccent);
+        }
+        SetTextColor(dc, i == sel ? kDkText : kDkGray);
+        DrawTextW(dc, text, -1, &ir, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    }
+    SelectObject(dc, old);
+    EndPaint(h, &ps);
+}
+
+// Пікер часу в темному режимі: у нього немає кольорів — малюємо клієнтську
+// область самі (фон, рамка, поточний текст), стрілки up-down — тема DarkMode_Explorer.
+LRESULT CALLBACK DtpSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)
+{
+    if (g_dark && msg == WM_ERASEBKGND) return 1;
+    if (g_dark && msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc;
+        GetClientRect(h, &rc);
+        FillRect(dc, &rc, g_brDkEdit);
+        FrameRect(dc, &rc, g_brDkBorder);
+        wchar_t text[64] = {};
+        GetWindowTextW(h, text, 63);
+        const UINT dpi = GetDpiForSystem();
+        HGDIOBJ old = SelectObject(dc, (HFONT)SendMessageW(h, WM_GETFONT, 0, 0));
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, IsWindowEnabled(h) ? kDkText : kDkGray);
+        RECT tr = rc;
+        tr.left  += MulDiv(6, dpi, 96);
+        tr.right -= MulDiv(22, dpi, 96);   // місце під стрілки
+        DrawTextW(dc, text, -1, &tr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+    return DefSubclassProc(h, msg, wp, lp);
+}
+
+BOOL CALLBACK ThemeChildProc(HWND h, LPARAM)
+{
+    wchar_t cls[32] = {};
+    GetClassNameW(h, cls, 32);
+    if (!lstrcmpiW(cls, L"Button") || !lstrcmpiW(cls, L"msctls_updown32") || !lstrcmpiW(cls, L"ScrollBar"))
+        SetWindowTheme(h, g_dark ? L"DarkMode_Explorer" : nullptr, nullptr);
+    else if (!lstrcmpiW(cls, L"Edit"))
+        SetWindowTheme(h, g_dark ? L"DarkMode_CFD" : nullptr, nullptr);
+    return TRUE;
+}
+
+void ApplyWindowTheme(bool force)
+{
+    const bool dark = ComputeDark();
+    if (!force && dark == g_dark) return;
+    g_dark = dark;
+    if (!g_brDkBg) {
+        g_brDkBg     = CreateSolidBrush(kDkBg);
+        g_brDkPage   = CreateSolidBrush(kDkPage);
+        g_brDkEdit   = CreateSolidBrush(kDkEdit);
+        g_brDkBorder = CreateSolidBrush(kDkBorder);
+        g_brDkThumb  = CreateSolidBrush(kDkThumb);
+        g_brDkAccent = CreateSolidBrush(kDkAccent);
+    }
+    const BOOL b = dark ? TRUE : FALSE;
+    DwmSetWindowAttribute(g_mainWnd, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &b, sizeof(b));
+    EnumChildWindows(g_mainWnd, ThemeChildProc, 0);
+    RedrawWindow(g_mainWnd, nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_FRAME | RDW_UPDATENOW);
+}
+
 LRESULT CALLBACK TabSubclassProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR)
 {
     if (msg == WM_ERASEBKGND) {
         HDC dc = (HDC)wp;
         RECT rc;
         GetClientRect(h, &rc);
-        FillRect(dc, &rc, GetSysColorBrush(COLOR_BTNFACE));
+        FillRect(dc, &rc, g_dark ? g_brDkBg : GetSysColorBrush(COLOR_BTNFACE));
         RECT page = rc;
         SendMessageW(h, TCM_ADJUSTRECT, FALSE, (LPARAM)&page);   // область сторінки без рамки
-        FillRect(dc, &page, GetSysColorBrush(COLOR_WINDOW));
+        FillRect(dc, &page, g_dark ? g_brDkPage : GetSysColorBrush(COLOR_WINDOW));
         return 1;
+    }
+    if (msg == WM_PAINT && g_dark) {
+        PaintTabDark(h);
+        return 0;
     }
     if (msg == WM_PAINT) {
         // Тема може зафарбувати панель по-своєму ПІСЛЯ erase — тому полотно
@@ -2137,6 +2333,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_NOTIFY: {
         const NMHDR* nm = (const NMHDR*)lp;
+        // CAPS-8: у темному режимі повзунки і чекбокси/радіо малюємо самі
+        if (nm->code == NM_CUSTOMDRAW && g_dark) {
+            NMCUSTOMDRAW* cd = (NMCUSTOMDRAW*)lp;
+            wchar_t cls[32] = {};
+            GetClassNameW(nm->hwndFrom, cls, 32);
+            if (!lstrcmpiW(cls, TRACKBAR_CLASSW)) {
+                if (cd->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (cd->dwDrawStage == CDDS_ITEMPREPAINT) {
+                    if (cd->dwItemSpec == TBCD_CHANNEL) { FillRect(cd->hdc, &cd->rc, g_brDkBorder); return CDRF_SKIPDEFAULT; }
+                    if (cd->dwItemSpec == TBCD_THUMB)   { FillRect(cd->hdc, &cd->rc, g_brDkThumb);  return CDRF_SKIPDEFAULT; }
+                    if (cd->dwItemSpec == TBCD_TICS)    return CDRF_SKIPDEFAULT;
+                }
+                return CDRF_DODEFAULT;
+            }
+            if (!lstrcmpiW(cls, L"Button") && IsCheckOrRadio(nm->hwndFrom) && cd->dwDrawStage == CDDS_PREPAINT) {
+                DrawCheckDark(nm->hwndFrom, cd->hdc, cd->rc);
+                return CDRF_SKIPDEFAULT;
+            }
+        }
         if (nm->hwndFrom == g_tabs && nm->code == TCN_SELCHANGE)
             SelectTab((int)SendMessageW(g_tabs, TCM_GETCURSEL, 0, 0));
         // CAPS-7: розклад дня/ночі
@@ -2180,6 +2395,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         L"capslang", MB_ICONERROR | MB_OK);
                 SendMessageW(g_checkbox, BM_SETCHECK,
                              AutostartEnabled() ? BST_CHECKED : BST_UNCHECKED, 0);
+            }
+            return 0;
+        case IDC_WT_AUTO:         // CAPS-8
+        case IDC_WT_LIGHT:
+        case IDC_WT_DARK:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_winTheme = (WinTheme)(LOWORD(wp) - IDC_WT_AUTO);
+                RegSaveInt(kRegWindowTheme, (int)g_winTheme);
+                ApplyWindowTheme(true);
             }
             return 0;
         case IDC_LAYOUT_ENABLE:   // CAPS-9
@@ -2285,15 +2509,55 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         PaintWindow(hwnd);
         return 0;
 
+    case WM_ERASEBKGND:   // CAPS-8: у темному режимі фон вікна — наш
+        if (g_dark) {
+            RECT rc;
+            GetClientRect(hwnd, &rc);
+            FillRect((HDC)wp, &rc, g_brDkBg);
+            return 1;
+        }
+        break;
+
+    case WM_SETTINGCHANGE:   // CAPS-8: «Автоматично» слідує за темою застосунків Windows
+        if (lp && !lstrcmpiW((LPCWSTR)lp, L"ImmersiveColorSet"))
+            ApplyWindowTheme(false);
+        return 0;
+
     case WM_CTLCOLORSTATIC: {
         const int id = GetDlgCtrlID((HWND)lp);
+        const bool gray = (id == IDC_COPYRIGHT || id == IDC_PASSTHROUGH_HINT || id == IDC_HINT_GRAY);
+        if (g_dark) {
+            wchar_t cls[16] = {};
+            GetClassNameW((HWND)lp, cls, 16);
+            const bool isEdit = !lstrcmpiW(cls, L"Edit");   // вимкнене поле теж шле STATIC
+            const COLORREF bg = isEdit ? kDkEdit : (IsPageControl((HWND)lp) ? kDkPage : kDkBg);
+            SetBkMode((HDC)wp, TRANSPARENT);
+            SetBkColor((HDC)wp, bg);
+            SetTextColor((HDC)wp, (gray || (isEdit && !IsWindowEnabled((HWND)lp))) ? kDkGray : kDkText);
+            return (LRESULT)(isEdit ? g_brDkEdit : (IsPageControl((HWND)lp) ? g_brDkPage : g_brDkBg));
+        }
         const int color = IsPageControl((HWND)lp) ? COLOR_WINDOW : COLOR_BTNFACE;
         SetBkMode((HDC)wp, TRANSPARENT);
         SetBkColor((HDC)wp, GetSysColor(color));
-        if (id == IDC_COPYRIGHT || id == IDC_PASSTHROUGH_HINT || id == IDC_HINT_GRAY)
+        if (gray)
             SetTextColor((HDC)wp, GetSysColor(COLOR_GRAYTEXT));
         return (LRESULT)GetSysColorBrush(color);
     }
+
+    case WM_CTLCOLOREDIT:   // CAPS-8
+        if (g_dark) {
+            SetBkColor((HDC)wp, kDkEdit);
+            SetTextColor((HDC)wp, kDkText);
+            return (LRESULT)g_brDkEdit;
+        }
+        break;
+
+    case WM_CTLCOLORBTN:    // CAPS-8: підкладка кнопок
+        if (g_dark) {
+            SetBkColor((HDC)wp, IsPageControl((HWND)lp) ? kDkPage : kDkBg);
+            return (LRESULT)(IsPageControl((HWND)lp) ? g_brDkPage : g_brDkBg);
+        }
+        break;
 
     case WM_CLOSE:
         CommitAdvanced();          // підхопити те, що набрали й не зняли фокус
@@ -2346,6 +2610,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     LoadCursorSettings();
     LoadThemeSettings();   // CAPS-7
     g_layoutOn = RegLoadInt(kRegLayoutSwitch, 1, 0, 1) != 0;   // CAPS-9
+    g_winTheme = (WinTheme)RegLoadInt(kRegWindowTheme, 0, 0, 2); // CAPS-8
     // Якщо попередній запуск обірвався із збільшеним курсором — повертаємо розмір
     // ДО того, як щось показуємо користувачу.
     RecoverCursorSize();
@@ -2446,6 +2711,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
             0, 28, 78, 410, 18, IDC_HINT_GRAY));
     addS(mk(L"STATIC", L"Вікно можна закрити — програма лишається в треї.",
             0, 28, 112, 410, 18, IDC_HINT_GRAY));
+    // CAPS-8: тема самого вікна
+    addS(mk(L"STATIC", L"Тема вікна:", 0, 28, 150, 200, 20, 0));
+    addS(mk(L"BUTTON", L"Автоматично", BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP,
+            28, 172, 130, 22, IDC_WT_AUTO));
+    addS(mk(L"BUTTON", L"Завжди світла", BS_AUTORADIOBUTTON, 168, 172, 130, 22, IDC_WT_LIGHT));
+    addS(mk(L"BUTTON", L"Завжди темна",  BS_AUTORADIOBUTTON, 308, 172, 130, 22, IDC_WT_DARK));
+    CheckRadioButton(hwnd, IDC_WT_AUTO, IDC_WT_DARK, IDC_WT_AUTO + (int)g_winTheme);
+    addS(mk(L"STATIC", L"«Автоматично» — як тема застосунків Windows (див. «День/ніч»).",
+            0, 28, 198, 410, 18, IDC_HINT_GRAY));
 
     // ---- вкладка «Курсор» ----
     g_curEnable = addC(mk(L"BUTTON", L"Збільшувати курсор, якщо потрусити мишею",
@@ -2518,6 +2792,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
                             348, 155, 90, 24, IDC_TH_LIGHT_FROM));
     SetPickerMinutes(g_thDarkFrom,  g_th.darkFrom);
     SetPickerMinutes(g_thLightFrom, g_th.lightFrom);
+    SetWindowSubclass(g_thDarkFrom,  DtpSubclassProc, 1, 0);   // CAPS-8: темний режим
+    SetWindowSubclass(g_thLightFrom, DtpSubclassProc, 1, 0);
 
     g_thToggle = addT(mk(L"BUTTON", L"Переключити зараз", BS_PUSHBUTTON | WS_TABSTOP,
                          28, 196, 170, 26, IDC_TH_TOGGLE));
@@ -2578,6 +2854,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     g_mainWnd = hwnd;
+    ApplyWindowTheme(true);   // CAPS-8: тема вікна до першого показу
 
     // CAPS-7: одразу привести тему до часу доби; координати — з кешу, свіжі у фоні.
     EnableThemeControls();
