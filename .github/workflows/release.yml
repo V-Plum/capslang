@@ -59,8 +59,11 @@ jobs:
       - name: Embedded public key must match capslang_signing_pub.pem
         run: |
           $ossl = "C:\Program Files\Git\usr\bin\openssl.exe"
-          $der = & $ossl ec -pubin -in capslang_signing_pub.pem -outform DER 2>$null
-          $bytes = [byte[]]$der
+          # DER — у файл: PowerShell перетворює бінарний stdout на текст і псує байти
+          $derPath = Join-Path $env:RUNNER_TEMP "pub.der"
+          & $ossl ec -pubin -in capslang_signing_pub.pem -outform DER -out $derPath
+          if ($LASTEXITCODE -ne 0) { throw "openssl could not read capslang_signing_pub.pem" }
+          $bytes = [IO.File]::ReadAllBytes($derPath)
           $xy = ($bytes[($bytes.Length - 64)..($bytes.Length - 1)] | ForEach-Object { $_.ToString("x2") }) -join ""
           if (-not (Select-String -Path capslang.cpp -Pattern $xy -SimpleMatch -Quiet)) { throw "kUpdatePubKeyHex in capslang.cpp does not match capslang_signing_pub.pem" }
           "public key ok: $($xy.Substring(0,16))..."
