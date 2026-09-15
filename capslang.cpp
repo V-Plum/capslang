@@ -42,8 +42,8 @@
 #include <stdlib.h>
 // CAPS-7: день/ніч — геолокація за IP (WinINet), Location API (COM), час, форматування.
 #include <wininet.h>
-#include <initguid.h>      // GUID-и Location API визначаються в цьому TU (MSVC інакше вимагає uuid.lib)
-#include <locationapi.h>
+#include <locationapi.h>   // лише інтерфейси; GUID-и нижче свої — SDK MSVC тримає їх у locationapi.lib,
+                           // MinGW — у заголовку, і сходяться вони лише через власні копії
 #include <time.h>
 #include <stdio.h>
 #include <string.h>
@@ -182,6 +182,11 @@ const wchar_t* kRegThemeOvDark    = L"ThemeOverrideDark";
 const wchar_t* kPersonalize = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
 
 enum class LocSource { Auto = 0, Windows = 1, Ip = 2, Manual = 3, TimeZone = 4 };
+
+// Location API (Win32, COM). Власні копії GUID-ів — див. коментар біля #include.
+const GUID kCLSID_Location     = { 0xe5b8e079, 0xee6d, 0x4e33, { 0xa4, 0x38, 0xc8, 0x7f, 0x2e, 0x95, 0x92, 0x54 } };
+const GUID kIID_ILocation      = { 0xab2ece69, 0x56d9, 0x4f28, { 0xb5, 0x25, 0xde, 0x1b, 0x0e, 0xe4, 0x42, 0x37 } };
+const GUID kIID_ILatLongReport = { 0x7fed806d, 0x0ef8, 0x4f07, { 0x80, 0xac, 0x36, 0xa0, 0xbe, 0xae, 0x31, 0x34 } };
 
 struct ThemeSettings {
     bool enabled    = false;
@@ -1491,20 +1496,20 @@ void ThemeApply(bool dark)
 bool LocateWindows(double& lat, double& lon, bool allowPrompt)
 {
     ILocation* loc = nullptr;
-    if (FAILED(CoCreateInstance(CLSID_Location, nullptr, CLSCTX_INPROC_SERVER,
-                                IID_ILocation, (void**)&loc)) || !loc)
+    if (FAILED(CoCreateInstance(kCLSID_Location, nullptr, CLSCTX_INPROC_SERVER,
+                                kIID_ILocation, (void**)&loc)) || !loc)
         return false;
     bool ok = false;
-    IID types[1] = { IID_ILatLongReport };
+    IID types[1] = { kIID_ILatLongReport };
     if (allowPrompt) loc->RequestPermissions(nullptr, types, 1, TRUE);
     for (int i = 0; i < 20; ++i) {           // до ~10 с: сенсор може прокидатись
         LOCATION_REPORT_STATUS st = REPORT_NOT_SUPPORTED;
-        if (FAILED(loc->GetReportStatus(IID_ILatLongReport, &st))) break;
+        if (FAILED(loc->GetReportStatus(kIID_ILatLongReport, &st))) break;
         if (st == REPORT_RUNNING) {
             ILocationReport* rep = nullptr;
-            if (SUCCEEDED(loc->GetReport(IID_ILatLongReport, &rep)) && rep) {
+            if (SUCCEEDED(loc->GetReport(kIID_ILatLongReport, &rep)) && rep) {
                 ILatLongReport* ll = nullptr;
-                if (SUCCEEDED(rep->QueryInterface(IID_ILatLongReport, (void**)&ll)) && ll) {
+                if (SUCCEEDED(rep->QueryInterface(kIID_ILatLongReport, (void**)&ll)) && ll) {
                     double la = 0, lo = 0;
                     if (SUCCEEDED(ll->GetLatitude(&la)) && SUCCEEDED(ll->GetLongitude(&lo))) {
                         lat = la; lon = lo; ok = true;
