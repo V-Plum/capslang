@@ -40,6 +40,14 @@
 // у полях «Детально» інакше валять саме релізну збірку, а не локальну.
 #include <math.h>
 #include <stdlib.h>
+// CAPS-7: день/ніч — геолокація за IP (WinINet), Location API (COM), час, форматування.
+#include <wininet.h>
+#include <initguid.h>      // GUID-и Location API визначаються в цьому TU (MSVC інакше вимагає uuid.lib)
+#include <locationapi.h>
+#include <time.h>
+#include <stdio.h>
+#include <string.h>
+#include <limits.h>
 
 namespace {
 
@@ -48,6 +56,7 @@ constexpr UINT WMAPP_SHOWSETTINGS = WM_APP + 2;
 constexpr UINT WMAPP_SWITCH       = WM_APP + 3;
 constexpr UINT WMAPP_SHAKE        = WM_APP + 4;   // від мишачого хука: жест розпізнано
 constexpr UINT WMAPP_MAGDONE      = WM_APP + 5;   // потік анімації: зменшення завершено
+constexpr UINT WMAPP_THEMELOC     = WM_APP + 6;   // потік геолокації: lp = LocResult* (heap)
 constexpr UINT HKW_INSTALL        = WM_APP + 20;  // до вікна потоку хука
 constexpr UINT HKW_UNINSTALL      = WM_APP + 21;
 constexpr UINT HKW_MOUSE_ON       = WM_APP + 22;
@@ -72,12 +81,30 @@ constexpr int  IDC_CUR_REVERSALS = 118;
 constexpr int  IDC_CUR_SHRINK    = 119;
 constexpr int  IDC_CUR_OVERLAY   = 121;
 constexpr int  IDC_HINT_GRAY     = 120;  // будь-який сірий пояснювальний текст
+// CAPS-7: вкладка «День/ніч»
+constexpr int  IDC_TH_ENABLE     = 130;
+constexpr int  IDC_TH_BY_SUN     = 131;
+constexpr int  IDC_TH_BY_SCHED   = 132;
+constexpr int  IDC_TH_DARK_FROM  = 133;
+constexpr int  IDC_TH_LIGHT_FROM = 134;
+constexpr int  IDC_TH_TOGGLE     = 135;
+constexpr int  IDC_TH_ADVANCED   = 136;
+constexpr int  IDC_TH_SRC_AUTO   = 137;  // порядок = LocSource
+constexpr int  IDC_TH_SRC_WIN    = 138;
+constexpr int  IDC_TH_SRC_IP     = 139;
+constexpr int  IDC_TH_SRC_MANUAL = 140;
+constexpr int  IDC_TH_SRC_TZ     = 141;
+constexpr int  IDC_TH_LAT        = 142;
+constexpr int  IDC_TH_LON        = 143;
+constexpr int  IDC_TH_STATUS     = 144;
+constexpr int  IDC_TH_NOW        = 145;
 constexpr int  IDR_LOGO_PNG    = 100;  // RCDATA з capslang.png
 constexpr int  HOTKEY_ID       = 1;
 constexpr UINT IDM_SETTINGS    = 1;
 constexpr UINT IDM_EXIT        = 2;
 constexpr UINT TIMER_MAG_HOLD   = 1;
 constexpr UINT TIMER_MAG_FRAME  = 2;   // кадр оверлейної анімації
+constexpr UINT TIMER_THEME      = 3;   // CAPS-7: перевірка теми раз на хвилину
 
 const wchar_t* kWndClass = L"capslang";
 const wchar_t* kTaskName = L"capslang";
@@ -126,6 +153,75 @@ HHOOK  g_hook = nullptr;
 HHOOK  g_mouseHook = nullptr;
 HWND   g_mainWnd = nullptr;
 bool   g_capsDown = false;  // щоб автоповтор не перемикав розкладку нескінченно
+
+// ---------- CAPS-7: день/ніч — автоматична світла/темна тема Windows ----------
+//
+// Тема — два DWORD у HKCU\...\Themes\Personalize (AppsUseLightTheme,
+// SystemUsesLightTheme; 0 = темна) + бродкаст WM_SETTINGCHANGE "ImmersiveColorSet",
+// без якого частина вікон не перемальовується. Перемикаємо обидва разом (рішення
+// власника: менше мішанини). Момент — за сходом/заходом сонця (NOAA) або за
+// розкладом. Розташування: служба геолокації Windows → за IP → часовий пояс і
+// регіон Windows, або вручну; результат кешується в реєстрі, щоб після старту не
+// чекати сенсора чи мережі. «Переключити зараз» — ручний вибір ДО НАСТУПНОЇ МЕЖІ
+// (наступного сходу/заходу або часу розкладу), далі автоматика знову рахує стан
+// від розкладу, а не просто фліпає. Поки на передньому плані повноекранна
+// програма, тему не чіпаємо — перемкнемо, щойно вона закриється.
+const wchar_t* kRegThemeAuto      = L"ThemeAuto";
+const wchar_t* kRegThemeSched     = L"ThemeBySchedule";
+const wchar_t* kRegThemeDarkFrom  = L"ThemeDarkFromMin";
+const wchar_t* kRegThemeLightFrom = L"ThemeLightFromMin";
+const wchar_t* kRegThemeLocSrc    = L"ThemeLocationSource";
+const wchar_t* kRegThemeLat       = L"ThemeLatitude";        // ручні координати, REG_SZ
+const wchar_t* kRegThemeLon       = L"ThemeLongitude";
+const wchar_t* kRegThemeCacheLat  = L"ThemeCacheLatitude";   // останнє визначене розташування
+const wchar_t* kRegThemeCacheLon  = L"ThemeCacheLongitude";
+const wchar_t* kRegThemeCacheSrc  = L"ThemeCacheSource";
+const wchar_t* kRegThemeCacheAt   = L"ThemeCacheAt";         // unix-час (DWORD)
+const wchar_t* kRegThemeOvUntil   = L"ThemeOverrideUntil";   // ручний вибір діє до (unix)
+const wchar_t* kRegThemeOvDark    = L"ThemeOverrideDark";
+const wchar_t* kPersonalize = L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize";
+
+enum class LocSource { Auto = 0, Windows = 1, Ip = 2, Manual = 3, TimeZone = 4 };
+
+struct ThemeSettings {
+    bool enabled    = false;
+    bool bySchedule = false;    // false = за сонцем
+    int  darkFrom   = 19 * 60;  // хвилини від півночі
+    int  lightFrom  = 7 * 60;
+    LocSource src   = LocSource::Auto;
+    bool   hasManual = false;   // ручні координати задано
+    double lat = 0, lon = 0;    // ручні координати
+};
+struct ThemeFix {               // розташування, за яким рахуємо сонце
+    bool   ok = false;
+    double lat = 0, lon = 0;
+    LocSource src = LocSource::Auto;
+    __time64_t at = 0;
+};
+struct LocResult {              // відповідь потоку геолокації
+    bool   ok = false;
+    double lat = 0, lon = 0;
+    LocSource src = LocSource::Auto;
+    bool   prompt = false;      // показати системний діалог дозволу (лише явний вибір «Windows»)
+    LONG   gen = 0;
+};
+ThemeSettings g_th;
+ThemeFix      g_fix;
+__time64_t    g_thOvUntil = 0;     // 0 = ручного вибору немає
+bool          g_thOvDark  = false;
+bool          g_thPending = false; // треба перемкнути, чекаємо закриття повноекранної програми
+bool          g_locFailed = false; // остання спроба визначити розташування провалилась
+bool          g_locPrompted = false;
+bool          g_locAgain  = false; // джерело змінили під час визначення — повторити
+volatile LONG g_locBusy = 0;
+LONG          g_locGen  = 0;
+HWND g_pageTheme[40] = {};  int g_pageThemeN = 0;
+HWND g_thAdv[20]     = {};  int g_thAdvN = 0;
+bool g_thAdvVisible = false;
+HWND g_thEnable = nullptr, g_thBySun = nullptr, g_thBySched = nullptr;
+HWND g_thDarkFrom = nullptr, g_thLightFrom = nullptr, g_thToggle = nullptr;
+HWND g_thAdvBtn = nullptr, g_thStatus = nullptr, g_thNow = nullptr;
+HWND g_thLat = nullptr, g_thLon = nullptr, g_thSrc[5] = {};
 
 // ---------- CAPS-2: збільшення курсора по трусінню мишею ----------
 //
@@ -586,6 +682,8 @@ void ApplyRemoteContext()
         SetHotkey(!RemotePassthroughActive());
 }
 
+void ThemeTick();   // CAPS-7, визначення нижче
+
 // Зміна активного вікна: оновлюємо ознаку remote і підлаштовуємо перехоплення.
 // Викликається з WinEvent-колбека на головному потоці — тому RegisterHotKey
 // коректно виконується на потоці-власнику g_mainWnd.
@@ -593,6 +691,7 @@ void OnForegroundChanged()
 {
     g_inRemote = IsRemoteWindow(GetForegroundWindow());
     ApplyRemoteContext();
+    if (g_thPending) ThemeTick();   // CAPS-7: повноекранна програма могла закритись
 }
 
 void CALLBACK WinEventProc(HWINEVENTHOOK, DWORD event, HWND, LONG, LONG, DWORD, DWORD)
@@ -1206,6 +1305,411 @@ void PaintWindow(HWND hwnd)
     EndPaint(hwnd, &ps);
 }
 
+// ---------- CAPS-7: день/ніч — реєстр, час, сонце ----------
+
+bool RegLoadStr(const wchar_t* name, wchar_t* buf, DWORD cch)
+{
+    DWORD size = cch * sizeof(wchar_t);
+    return RegGetValueW(HKEY_CURRENT_USER, kRegPath, name, RRF_RT_REG_SZ,
+                        nullptr, buf, &size) == ERROR_SUCCESS;
+}
+
+void RegSaveStr(const wchar_t* name, const wchar_t* value)
+{
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegPath, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(key, name, 0, REG_SZ, (const BYTE*)value,
+                   (DWORD)((lstrlenW(value) + 1) * sizeof(wchar_t)));
+    RegCloseKey(key);
+}
+
+// Координата з поля/реєстру: приймаємо і «50.77», і «50,77».
+bool ParseCoord(const wchar_t* s, double lo, double hi, double& out)
+{
+    wchar_t tmp[32] = {};
+    for (int i = 0; i < 31 && s[i]; ++i) tmp[i] = (s[i] == L',') ? L'.' : s[i];
+    wchar_t* end = nullptr;
+    const double v = wcstod(tmp, &end);
+    if (end == tmp || v < lo || v > hi) return false;
+    out = v;
+    return true;
+}
+
+__time64_t NowUnix() { return _time64(nullptr); }
+
+void LocalDate(__time64_t t, int& y, int& m, int& d, int& minOfDay)
+{
+    struct tm lt = {};
+    _localtime64_s(&lt, &t);
+    y = lt.tm_year + 1900; m = lt.tm_mon + 1; d = lt.tm_mday;
+    minOfDay = lt.tm_hour * 60 + lt.tm_min;
+}
+
+void FormatClock(wchar_t* buf, size_t n, __time64_t t)
+{
+    struct tm lt = {};
+    _localtime64_s(&lt, &t);
+    swprintf(buf, n, L"%02d:%02d", lt.tm_hour, lt.tm_min);
+}
+
+// ---- CAPS-7: sun math begin ----
+constexpr double kPi = 3.14159265358979323846;
+double Rad(double d) { return d * kPi / 180.0; }
+double Deg(double r) { return r * 180.0 / kPi; }
+
+double JulianDay(int y, int m, int d)   // 0:00 UTC заданої дати
+{
+    if (m <= 2) { y--; m += 12; }
+    const int A = y / 100, B = 2 - A + A / 4;
+    return floor(365.25 * (y + 4716)) + floor(30.6001 * (m + 1)) + d + B - 1524.5;
+}
+
+// Схід/захід за NOAA (точність ~1 хв). riseMin/setMin — хвилини UTC від 0:00 дати
+// (можуть виходити за межі доби для далеких поясів). false = сонце цієї доби не
+// сходить (polarDay=false) або не заходить (polarDay=true).
+bool SunTimesUtc(int y, int m, int d, double lat, double lon,
+                 double& riseMin, double& setMin, bool& polarDay)
+{
+    const double jc = (JulianDay(y, m, d) + 0.5 - 2451545.0) / 36525.0;
+    const double L0 = fmod(280.46646 + jc * (36000.76983 + jc * 0.0003032), 360.0);
+    const double M  = 357.52911 + jc * (35999.05029 - 0.0001537 * jc);
+    const double e  = 0.016708634 - jc * (0.000042037 + 0.0000001267 * jc);
+    const double C  = sin(Rad(M)) * (1.914602 - jc * (0.004817 + 0.000014 * jc))
+                    + sin(Rad(2 * M)) * (0.019993 - 0.000101 * jc)
+                    + sin(Rad(3 * M)) * 0.000289;
+    const double omega   = 125.04 - 1934.136 * jc;
+    const double appLong = L0 + C - 0.00569 - 0.00478 * sin(Rad(omega));
+    const double obl0 = 23.0 + (26.0 + (21.448 - jc * (46.815 + jc * (0.00059 - jc * 0.001813))) / 60.0) / 60.0;
+    const double obl  = obl0 + 0.00256 * cos(Rad(omega));
+    const double decl = asin(sin(Rad(obl)) * sin(Rad(appLong)));
+    const double yy   = tan(Rad(obl / 2)) * tan(Rad(obl / 2));
+    const double eqTime = 4 * Deg(yy * sin(2 * Rad(L0)) - 2 * e * sin(Rad(M))
+                          + 4 * e * yy * sin(Rad(M)) * cos(2 * Rad(L0))
+                          - 0.5 * yy * yy * sin(4 * Rad(L0)) - 1.25 * e * e * sin(2 * Rad(M)));
+    const double cosHa = cos(Rad(90.833)) / (cos(Rad(lat)) * cos(decl)) - tan(Rad(lat)) * tan(decl);
+    if (cosHa >= 1.0)  { polarDay = false; return false; }
+    if (cosHa <= -1.0) { polarDay = true;  return false; }
+    const double ha   = Deg(acos(cosHa));
+    const double noon = 720.0 - 4.0 * lon - eqTime;
+    riseMin = noon - ha * 4.0;
+    setMin  = noon + ha * 4.0;
+    return true;
+}
+
+// Схід/захід (unix) для локальної дати, що містить t. 0 = ок, 1 = полярна ніч,
+// 2 = полярний день.
+int SunEventsFor(__time64_t t, double lat, double lon, __time64_t& rise, __time64_t& set)
+{
+    int y, m, d, mod;
+    LocalDate(t, y, m, d, mod);
+    double r = 0, s = 0; bool pd = false;
+    if (!SunTimesUtc(y, m, d, lat, lon, r, s, pd)) return pd ? 2 : 1;
+    struct tm g = {};
+    g.tm_year = y - 1900; g.tm_mon = m - 1; g.tm_mday = d;
+    const __time64_t base = _mkgmtime64(&g);
+    rise = base + (__time64_t)llround(r * 60.0);
+    set  = base + (__time64_t)llround(s * 60.0);
+    return 0;
+}
+// ---- CAPS-7: sun math end ----
+
+// Що має бути зараз за налаштуваннями (без урахування ручного вибору) і коли
+// наступна межа. usedFallback — координат нема, тимчасово рахуємо за 07:00/19:00.
+bool ThemeWantDark(__time64_t now, __time64_t& nextBoundary, bool& usedFallback)
+{
+    usedFallback = false;
+    if (!g_th.bySchedule && g_fix.ok) {
+        __time64_t rise = 0, set = 0;
+        const int kind = SunEventsFor(now, g_fix.lat, g_fix.lon, rise, set);
+        if (kind == 0) {
+            if (now < rise) { nextBoundary = rise; return true; }
+            if (now < set)  { nextBoundary = set;  return false; }
+            __time64_t r2 = 0, s2 = 0;      // після заходу — до завтрашнього сходу
+            nextBoundary = (SunEventsFor(now + 86400, g_fix.lat, g_fix.lon, r2, s2) == 0)
+                           ? r2 : now + 86400;
+            return true;
+        }
+        nextBoundary = now + 6 * 3600;   // полярний день/ніч — перевіримо пізніше
+        return kind == 1;
+    }
+    int df = g_th.darkFrom, lf = g_th.lightFrom;
+    if (!g_th.bySchedule) { usedFallback = true; df = 19 * 60; lf = 7 * 60; }
+    int y, m, d, mod;
+    LocalDate(now, y, m, d, mod);
+    auto at = [&](int minutes, int dayOffset) {
+        struct tm lt = {};
+        lt.tm_year = y - 1900; lt.tm_mon = m - 1; lt.tm_mday = d + dayOffset;
+        lt.tm_hour = minutes / 60; lt.tm_min = minutes % 60; lt.tm_isdst = -1;
+        return _mktime64(&lt);    // нормалізує d+1 і DST сама
+    };
+    if (df == lf) { nextBoundary = at(df, mod < df ? 0 : 1); return false; }
+    const bool dark = (df < lf) ? (mod >= df && mod < lf) : (mod >= df || mod < lf);
+    const __time64_t cands[4] = { at(df, 0), at(lf, 0), at(df, 1), at(lf, 1) };
+    nextBoundary = 0;
+    for (const __time64_t c : cands)
+        if (c > now && (nextBoundary == 0 || c < nextBoundary)) nextBoundary = c;
+    return dark;
+}
+
+bool ThemeIsDark()
+{
+    DWORD v = 1, size = sizeof(v);
+    if (RegGetValueW(HKEY_CURRENT_USER, kPersonalize, L"AppsUseLightTheme",
+                     RRF_RT_REG_DWORD, nullptr, &v, &size) == ERROR_SUCCESS)
+        return v == 0;
+    return false;
+}
+
+// Бродкаст — на окремому потоці: SendMessageTimeout чекає на кожне вікно, і
+// зависле вікно не має морозити наш UI.
+DWORD WINAPI ThemeBroadcastThread(LPVOID)
+{
+    DWORD_PTR res = 0;
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, (LPARAM)L"ImmersiveColorSet",
+                        SMTO_ABORTIFHUNG, 2000, &res);
+    return 0;
+}
+
+void ThemeApply(bool dark)
+{
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kPersonalize, 0, nullptr, 0,
+                        KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS)
+        return;
+    const DWORD v = dark ? 0 : 1;
+    RegSetValueExW(key, L"AppsUseLightTheme",   0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegSetValueExW(key, L"SystemUsesLightTheme", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(key);
+    if (HANDLE t = CreateThread(nullptr, 0, ThemeBroadcastThread, nullptr, 0, nullptr))
+        CloseHandle(t);
+}
+
+// ---------- CAPS-7: розташування ----------
+
+bool LocateWindows(double& lat, double& lon, bool allowPrompt)
+{
+    ILocation* loc = nullptr;
+    if (FAILED(CoCreateInstance(CLSID_Location, nullptr, CLSCTX_INPROC_SERVER,
+                                IID_ILocation, (void**)&loc)) || !loc)
+        return false;
+    bool ok = false;
+    IID types[1] = { IID_ILatLongReport };
+    if (allowPrompt) loc->RequestPermissions(nullptr, types, 1, TRUE);
+    for (int i = 0; i < 20; ++i) {           // до ~10 с: сенсор може прокидатись
+        LOCATION_REPORT_STATUS st = REPORT_NOT_SUPPORTED;
+        if (FAILED(loc->GetReportStatus(IID_ILatLongReport, &st))) break;
+        if (st == REPORT_RUNNING) {
+            ILocationReport* rep = nullptr;
+            if (SUCCEEDED(loc->GetReport(IID_ILatLongReport, &rep)) && rep) {
+                ILatLongReport* ll = nullptr;
+                if (SUCCEEDED(rep->QueryInterface(IID_ILatLongReport, (void**)&ll)) && ll) {
+                    double la = 0, lo = 0;
+                    if (SUCCEEDED(ll->GetLatitude(&la)) && SUCCEEDED(ll->GetLongitude(&lo))) {
+                        lat = la; lon = lo; ok = true;
+                    }
+                    ll->Release();
+                }
+                rep->Release();
+            }
+            break;
+        }
+        if (st == REPORT_ACCESS_DENIED || st == REPORT_NOT_SUPPORTED || st == REPORT_ERROR)
+            break;
+        Sleep(500);
+    }
+    loc->Release();
+    return ok;
+}
+
+// Один GET до ip-api.com (без ключа, HTTP — координати міста, не секрет).
+bool LocateIp(double& lat, double& lon)
+{
+    HINTERNET h = InternetOpenW(L"capslang", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    if (!h) return false;
+    DWORD to = 8000;
+    InternetSetOptionW(h, INTERNET_OPTION_CONNECT_TIMEOUT, &to, sizeof(to));
+    InternetSetOptionW(h, INTERNET_OPTION_RECEIVE_TIMEOUT, &to, sizeof(to));
+    bool ok = false;
+    HINTERNET u = InternetOpenUrlW(h, L"http://ip-api.com/json/?fields=status,lat,lon", nullptr, 0,
+                                   INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_NO_UI, 0);
+    if (u) {
+        char buf[1024] = {};
+        DWORD n = 0, total = 0;
+        while (total < sizeof(buf) - 1 &&
+               InternetReadFile(u, buf + total, (DWORD)(sizeof(buf) - 1 - total), &n) && n > 0)
+            total += n;
+        buf[total] = 0;
+        const char* pla = strstr(buf, "\"lat\":");
+        const char* plo = strstr(buf, "\"lon\":");
+        if (strstr(buf, "\"status\":\"success\"") && pla && plo) {
+            lat = atof(pla + 6); lon = atof(plo + 6);
+            ok = fabs(lat) <= 90 && fabs(lon) <= 180 && (lat != 0 || lon != 0);
+        }
+        InternetCloseHandle(u);
+    }
+    InternetCloseHandle(h);
+    return ok;
+}
+
+// Найгрубіше: довгота з UTC-зміщення (60 хв = 15°), широта/довгота країни з
+// регіону Windows, якщо він є. Похибка сходу/заходу — до години.
+bool LocateTimeZone(double& lat, double& lon)
+{
+    TIME_ZONE_INFORMATION tzi = {};
+    if (GetTimeZoneInformation(&tzi) == TIME_ZONE_ID_INVALID) return false;
+    lon = -tzi.Bias / 4.0;
+    lat = 50.0;
+    wchar_t buf[32] = {};
+    const GEOID g = GetUserGeoID(GEOCLASS_NATION);
+    double v = 0;
+    if (g != GEOID_NOT_AVAILABLE && GetGeoInfoW(g, GEO_LATITUDE, buf, 32, 0) > 0 && ParseCoord(buf, -90, 90, v))
+        lat = v;
+    if (g != GEOID_NOT_AVAILABLE && GetGeoInfoW(g, GEO_LONGITUDE, buf, 32, 0) > 0 && ParseCoord(buf, -180, 180, v))
+        lon = v;
+    return true;
+}
+
+DWORD WINAPI LocateThread(LPVOID p)
+{
+    LocResult* r = (LocResult*)p;
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    r->ok = false;
+    auto tryWin = [&](bool prompt) { if (!r->ok && LocateWindows(r->lat, r->lon, prompt)) { r->src = LocSource::Windows;  r->ok = true; } };
+    auto tryIp  = [&]()            { if (!r->ok && LocateIp(r->lat, r->lon))              { r->src = LocSource::Ip;       r->ok = true; } };
+    auto tryTz  = [&]()            { if (!r->ok && LocateTimeZone(r->lat, r->lon))        { r->src = LocSource::TimeZone; r->ok = true; } };
+    switch (r->src) {
+    case LocSource::Windows:  tryWin(r->prompt); break;
+    case LocSource::Ip:       tryIp();  break;
+    case LocSource::TimeZone: tryTz();  break;
+    default:                  tryWin(false); tryIp(); tryTz(); break;   // Auto: без діалогів
+    }
+    CoUninitialize();
+    PostMessageW(g_mainWnd, WMAPP_THEMELOC, 0, (LPARAM)r);
+    return 0;
+}
+
+void SaveFixCache()
+{
+    wchar_t b[32];
+    swprintf(b, 32, L"%.5f", g_fix.lat); RegSaveStr(kRegThemeCacheLat, b);
+    swprintf(b, 32, L"%.5f", g_fix.lon); RegSaveStr(kRegThemeCacheLon, b);
+    RegSaveInt(kRegThemeCacheSrc, (int)g_fix.src);
+    RegSaveInt(kRegThemeCacheAt,  (int)(DWORD)g_fix.at);
+}
+
+void UseManualFix()
+{
+    g_fix.ok = g_th.hasManual;
+    g_fix.lat = g_th.lat; g_fix.lon = g_th.lon;
+    g_fix.src = LocSource::Manual;
+    g_fix.at  = NowUnix();
+}
+
+void StartLocate()
+{
+    if (g_th.src == LocSource::Manual) { UseManualFix(); return; }
+    if (InterlockedCompareExchange(&g_locBusy, 1, 0) != 0) return;   // уже визначаємо
+    LocResult* r = new LocResult;
+    r->src = g_th.src;
+    r->gen = ++g_locGen;
+    r->prompt = (g_th.src == LocSource::Windows) && !g_locPrompted;
+    if (r->prompt) g_locPrompted = true;
+    HANDLE t = CreateThread(nullptr, 0, LocateThread, r, 0, nullptr);
+    if (!t) { delete r; g_locBusy = 0; return; }
+    CloseHandle(t);
+}
+
+// ---------- CAPS-7: логіка перемикання ----------
+
+void UpdateThemeStatus();   // нижче, у розділі UI
+
+void ThemeTick()
+{
+    if (!g_th.enabled) return;
+    const __time64_t now = NowUnix();
+    __time64_t next = 0; bool fb = false;
+    bool want = ThemeWantDark(now, next, fb);
+    if (g_thOvUntil) {
+        if (now < g_thOvUntil) want = g_thOvDark;
+        else { g_thOvUntil = 0; RegDeleteInt(kRegThemeOvUntil); RegDeleteInt(kRegThemeOvDark); }
+    }
+    if (want != ThemeIsDark()) {
+        if (IsFullscreenForeground()) g_thPending = true;
+        else { ThemeApply(want); g_thPending = false; }
+    } else {
+        g_thPending = false;
+    }
+    // координати старіші за добу — оновити у фоні (сенсор/IP; ручні не старіють)
+    if (!g_th.bySchedule && g_th.src != LocSource::Manual && now - g_fix.at > 86400)
+        StartLocate();
+    UpdateThemeStatus();
+}
+
+void ThemeToggleNow()
+{
+    const bool target = !ThemeIsDark();
+    ThemeApply(target);
+    g_thPending = false;
+    if (g_th.enabled) {
+        __time64_t next = 0; bool fb = false;
+        ThemeWantDark(NowUnix(), next, fb);
+        g_thOvUntil = next; g_thOvDark = target;
+        RegSaveInt(kRegThemeOvUntil, (int)(DWORD)next);
+        RegSaveInt(kRegThemeOvDark, target ? 1 : 0);
+    }
+    UpdateThemeStatus();
+}
+
+void LoadThemeSettings()
+{
+    g_th.enabled    = RegLoadInt(kRegThemeAuto,  0, 0, 1) != 0;
+    g_th.bySchedule = RegLoadInt(kRegThemeSched, 0, 0, 1) != 0;
+    g_th.darkFrom   = RegLoadInt(kRegThemeDarkFrom,  19 * 60, 0, 1439);
+    g_th.lightFrom  = RegLoadInt(kRegThemeLightFrom, 7 * 60,  0, 1439);
+    g_th.src        = (LocSource)RegLoadInt(kRegThemeLocSrc, 0, 0, 4);
+    wchar_t b[32] = {};
+    g_th.hasManual = RegLoadStr(kRegThemeLat, b, 32) && ParseCoord(b, -90, 90, g_th.lat)
+                  && RegLoadStr(kRegThemeLon, b, 32) && ParseCoord(b, -180, 180, g_th.lon);
+    if (RegLoadStr(kRegThemeCacheLat, b, 32) && ParseCoord(b, -90, 90, g_fix.lat)
+     && RegLoadStr(kRegThemeCacheLon, b, 32) && ParseCoord(b, -180, 180, g_fix.lon)) {
+        g_fix.ok  = true;
+        g_fix.src = (LocSource)RegLoadInt(kRegThemeCacheSrc, 0, 0, 4);
+        g_fix.at  = (DWORD)RegLoadInt(kRegThemeCacheAt, 0, INT_MIN, INT_MAX);
+    }
+    if (g_th.src == LocSource::Manual) UseManualFix();
+    g_thOvUntil = (DWORD)RegLoadInt(kRegThemeOvUntil, 0, INT_MIN, INT_MAX);
+    g_thOvDark  = RegLoadInt(kRegThemeOvDark, 0, 0, 1) != 0;
+}
+
+void SaveThemeSettings()
+{
+    RegSaveInt(kRegThemeAuto,      g_th.enabled ? 1 : 0);
+    RegSaveInt(kRegThemeSched,     g_th.bySchedule ? 1 : 0);
+    RegSaveInt(kRegThemeDarkFrom,  g_th.darkFrom);
+    RegSaveInt(kRegThemeLightFrom, g_th.lightFrom);
+    RegSaveInt(kRegThemeLocSrc,    (int)g_th.src);
+}
+
+// Версія з VERSIONINFO самого exe — єдине джерело лишається capslang.rc.
+void ExeVersionString(wchar_t* buf, size_t n)
+{
+    buf[0] = 0;
+    wchar_t path[MAX_PATH] = {};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    DWORD dummy = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &dummy);
+    if (!size) return;
+    BYTE* data = new BYTE[size];
+    VS_FIXEDFILEINFO* ffi = nullptr; UINT len = 0;
+    if (GetFileVersionInfoW(path, 0, size, data) &&
+        VerQueryValueW(data, L"\\", (LPVOID*)&ffi, &len) && ffi)
+        swprintf(buf, n, L"%u.%u.%u", HIWORD(ffi->dwFileVersionMS),
+                 LOWORD(ffi->dwFileVersionMS), HIWORD(ffi->dwFileVersionLS));
+    delete[] data;
+}
+
 // ---------- CAPS-2: вкладки ----------
 
 void ShowGroup(HWND* items, int n, bool show)
@@ -1222,6 +1726,8 @@ bool IsPageControl(HWND c)
     for (int i = 0; i < g_pageLayoutN; ++i) if (g_pageLayout[i] == c) return true;
     for (int i = 0; i < g_pageCursorN; ++i) if (g_pageCursor[i] == c) return true;
     for (int i = 0; i < g_advN; ++i)        if (g_advCtrls[i]   == c) return true;
+    for (int i = 0; i < g_pageThemeN; ++i)  if (g_pageTheme[i]  == c) return true;
+    for (int i = 0; i < g_thAdvN; ++i)      if (g_thAdv[i]      == c) return true;
     return false;
 }
 
@@ -1239,6 +1745,8 @@ void SelectTab(int index)
     ShowGroup(g_pageLayout, g_pageLayoutN, index == 0);
     ShowGroup(g_pageCursor, g_pageCursorN, index == 1);
     ShowGroup(g_advCtrls, g_advN, index == 1 && g_advVisible);
+    ShowGroup(g_pageTheme, g_pageThemeN, index == 2);
+    ShowGroup(g_thAdv, g_thAdvN, index == 2 && g_thAdvVisible);
 }
 
 void ToggleAdvanced()
@@ -1246,6 +1754,137 @@ void ToggleAdvanced()
     g_advVisible = !g_advVisible;
     SetWindowTextW(g_curAdvBtn, g_advVisible ? L"Детально ▴" : L"Детально ▾");
     ShowGroup(g_advCtrls, g_advN, g_advVisible);
+}
+
+// ---------- CAPS-7: UI вкладки «День/ніч» ----------
+
+void ToggleThemeAdvanced()
+{
+    g_thAdvVisible = !g_thAdvVisible;
+    SetWindowTextW(g_thAdvBtn, g_thAdvVisible ? L"Детально ▴" : L"Детально ▾");
+    ShowGroup(g_thAdv, g_thAdvN, g_thAdvVisible);
+}
+
+void SetPickerMinutes(HWND p, int minutes)
+{
+    SendMessageW(p, DTM_SETFORMATW, 0, (LPARAM)L"HH:mm");
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    st.wHour = (WORD)(minutes / 60); st.wMinute = (WORD)(minutes % 60);
+    st.wSecond = 0; st.wMilliseconds = 0;
+    SendMessageW(p, DTM_SETSYSTEMTIME, GDT_VALID, (LPARAM)&st);
+}
+
+int GetPickerMinutes(HWND p, int fallback)
+{
+    SYSTEMTIME st = {};
+    if (SendMessageW(p, DTM_GETSYSTEMTIME, 0, (LPARAM)&st) != GDT_VALID) return fallback;
+    return st.wHour * 60 + st.wMinute;
+}
+
+const wchar_t* LocSourceName(LocSource s)
+{
+    switch (s) {
+    case LocSource::Windows:  return L"служба Windows";
+    case LocSource::Ip:       return L"за IP-адресою";
+    case LocSource::Manual:   return L"задано вручну";
+    case LocSource::TimeZone: return L"часовий пояс і регіон";
+    default:                  return L"автоматично";
+    }
+}
+
+void UpdateThemeStatus()
+{
+    wchar_t line[256] = {}, c1[8] = {}, c2[8] = {};
+    const __time64_t now = NowUnix();
+    if (g_th.bySchedule) {
+        swprintf(line, 256, L"Розклад: темна тема з %02d:%02d, світла з %02d:%02d.",
+                 g_th.darkFrom / 60, g_th.darkFrom % 60, g_th.lightFrom / 60, g_th.lightFrom % 60);
+    } else if (g_fix.ok) {
+        __time64_t r = 0, s = 0;
+        const int k = SunEventsFor(now, g_fix.lat, g_fix.lon, r, s);
+        wchar_t where[64];
+        swprintf(where, 64, L"%.2f°%s %.2f°%s", fabs(g_fix.lat), g_fix.lat >= 0 ? L"N" : L"S",
+                 fabs(g_fix.lon), g_fix.lon >= 0 ? L"E" : L"W");
+        if (k == 0) {
+            FormatClock(c1, 8, r); FormatClock(c2, 8, s);
+            swprintf(line, 256, L"Схід %s · захід %s · %s · %s", c1, c2, where, LocSourceName(g_fix.src));
+        } else {
+            swprintf(line, 256, L"%s · %s · %s", k == 2 ? L"Полярний день" : L"Полярна ніч",
+                     where, LocSourceName(g_fix.src));
+        }
+    } else if (g_locBusy) {
+        lstrcpyW(line, L"Визначаю розташування…");
+    } else if (g_th.src == LocSource::Manual) {
+        lstrcpyW(line, L"Введіть широту й довготу в «Детально». Поки що — розклад 07:00/19:00.");
+    } else {
+        lstrcpyW(line, L"Розташування не визначено — тимчасово розклад 07:00/19:00. Джерело — у «Детально».");
+    }
+    SetWindowTextW(g_thStatus, line);
+
+    const bool dark = ThemeIsDark();
+    if (!g_th.enabled) {
+        swprintf(line, 256, L"Зараз %s тема. Автоматика вимкнена.", dark ? L"темна" : L"світла");
+        SetWindowTextW(g_thNow, line);
+        return;
+    }
+    __time64_t next = 0; bool fb = false;
+    ThemeWantDark(now, next, fb);
+    wchar_t nb[8] = L"—";
+    if (g_thOvUntil && now < g_thOvUntil) {
+        FormatClock(nb, 8, g_thOvUntil);
+        swprintf(line, 256, L"Зараз %s тема (обрано вручну) — автоматика повернеться о %s.",
+                 dark ? L"темна" : L"світла", nb);
+    } else if (g_thPending) {
+        swprintf(line, 256, L"Перемкну на %s тему, щойно закриється повноекранна програма.",
+                 dark ? L"світлу" : L"темну");
+    } else {
+        if (next) FormatClock(nb, 8, next);
+        swprintf(line, 256, L"Зараз %s тема · наступне перемикання о %s.", dark ? L"темна" : L"світла", nb);
+    }
+    SetWindowTextW(g_thNow, line);
+}
+
+void EnableThemeControls()
+{
+    EnableWindow(g_thDarkFrom,  g_th.bySchedule);
+    EnableWindow(g_thLightFrom, g_th.bySchedule);
+    const bool manual = g_th.src == LocSource::Manual;
+    EnableWindow(g_thLat, manual);
+    EnableWindow(g_thLon, manual);
+}
+
+// Ручні координати приймаються, коли обидва поля валідні (широта ±90, довгота ±180).
+void CommitManualCoords()
+{
+    wchar_t a[32] = {}, b[32] = {};
+    GetWindowTextW(g_thLat, a, 31);
+    GetWindowTextW(g_thLon, b, 31);
+    double la = 0, lo = 0;
+    if (ParseCoord(a, -90, 90, la) && ParseCoord(b, -180, 180, lo)) {
+        g_th.lat = la; g_th.lon = lo; g_th.hasManual = true;
+        swprintf(a, 32, L"%.4f", la); RegSaveStr(kRegThemeLat, a); SetWindowTextW(g_thLat, a);
+        swprintf(b, 32, L"%.4f", lo); RegSaveStr(kRegThemeLon, b); SetWindowTextW(g_thLon, b);
+        if (g_th.src == LocSource::Manual) { UseManualFix(); ThemeTick(); }
+    }
+    UpdateThemeStatus();
+}
+
+void ThemeApplySettings()
+{
+    SaveThemeSettings();
+    EnableThemeControls();
+    if (g_th.enabled) {
+        SetTimer(g_mainWnd, TIMER_THEME, 60 * 1000, nullptr);
+        if (!g_th.bySchedule &&
+            (!g_fix.ok || (g_th.src != LocSource::Auto && g_fix.src != g_th.src)))
+            StartLocate();
+        ThemeTick();
+    } else {
+        KillTimer(g_mainWnd, TIMER_THEME);
+        g_thPending = false;
+        UpdateThemeStatus();
+    }
 }
 
 // Прочитати число з поля «Детально», притиснути до допустимого діапазону і
@@ -1353,6 +1992,38 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == TIMER_MAG_HOLD)       MagnifyBeginShrink();
         else if (wp == TIMER_MAG_FRAME) OverlayFrameTick();
+        else if (wp == TIMER_THEME)     ThemeTick();
+        return 0;
+
+    case WMAPP_THEMELOC: {   // CAPS-7: потік геолокації завершився
+        LocResult* r = (LocResult*)lp;
+        g_locBusy = 0;
+        if (r->gen == g_locGen && g_th.src != LocSource::Manual) {
+            if (r->ok) {
+                g_fix.ok = true; g_fix.lat = r->lat; g_fix.lon = r->lon;
+                g_fix.src = r->src; g_fix.at = NowUnix();
+                g_locFailed = false;
+                SaveFixCache();
+            } else {
+                g_locFailed = true;
+                g_fix.at = NowUnix();   // не довбати сенсор/мережу щохвилини
+            }
+            ThemeTick();
+            UpdateThemeStatus();
+        } else if (g_locAgain) {
+            g_locAgain = false;        // джерело змінили, поки тривало визначення
+            StartLocate();
+        }
+        delete r;
+        return 0;
+    }
+
+    case WM_POWERBROADCAST:   // CAPS-7: після сну тема має відповідати часу
+        if (wp == PBT_APMRESUMEAUTOMATIC) ThemeTick();
+        return TRUE;
+
+    case WM_TIMECHANGE:       // CAPS-7: змінили час/пояс
+        ThemeTick();
         return 0;
 
     case WMAPP_MAGDONE:   // системний розмір повернуто (lp = покоління анімації)
@@ -1379,6 +2050,21 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         const NMHDR* nm = (const NMHDR*)lp;
         if (nm->hwndFrom == g_tabs && nm->code == TCN_SELCHANGE)
             SelectTab((int)SendMessageW(g_tabs, TCM_GETCURSEL, 0, 0));
+        // CAPS-7: розклад дня/ночі
+        if (nm->code == DTN_DATETIMECHANGE &&
+            (nm->idFrom == IDC_TH_DARK_FROM || nm->idFrom == IDC_TH_LIGHT_FROM)) {
+            g_th.darkFrom  = GetPickerMinutes(g_thDarkFrom,  g_th.darkFrom);
+            g_th.lightFrom = GetPickerMinutes(g_thLightFrom, g_th.lightFrom);
+            SaveThemeSettings();
+            ThemeTick();
+            UpdateThemeStatus();
+        }
+        // CAPS-7: посилання на GitHub у підвалі. Через explorer, бо capslang
+        // елевейтований, а браузер має відкритись звичайним користувачем.
+        if (nm->idFrom == IDC_COPYRIGHT && (nm->code == NM_CLICK || nm->code == NM_RETURN)) {
+            const NMLINK* l = (const NMLINK*)lp;
+            ShellExecuteW(nullptr, L"open", L"explorer.exe", l->item.szUrl, nullptr, SW_SHOWNORMAL);
+        }
         return 0;
     }
 
@@ -1447,6 +2133,52 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == EN_KILLFOCUS)
                 CommitAdvanced();
             return 0;
+        // ---- CAPS-7: день/ніч ----
+        case IDC_TH_ENABLE:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_th.enabled = SendMessageW(g_thEnable, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                ThemeApplySettings();
+            }
+            return 0;
+        case IDC_TH_BY_SUN:
+        case IDC_TH_BY_SCHED:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_th.bySchedule = (LOWORD(wp) == IDC_TH_BY_SCHED);
+                ThemeApplySettings();
+            }
+            return 0;
+        case IDC_TH_TOGGLE:
+            if (HIWORD(wp) == BN_CLICKED) ThemeToggleNow();
+            return 0;
+        case IDC_TH_ADVANCED:
+            if (HIWORD(wp) == BN_CLICKED) ToggleThemeAdvanced();
+            return 0;
+        case IDC_TH_SRC_AUTO:
+        case IDC_TH_SRC_WIN:
+        case IDC_TH_SRC_IP:
+        case IDC_TH_SRC_MANUAL:
+        case IDC_TH_SRC_TZ:
+            if (HIWORD(wp) == BN_CLICKED) {
+                g_th.src = (LocSource)(LOWORD(wp) - IDC_TH_SRC_AUTO);
+                RegSaveInt(kRegThemeLocSrc, (int)g_th.src);
+                EnableThemeControls();
+                g_locFailed = false;
+                if (g_th.src == LocSource::Manual) {
+                    CommitManualCoords();          // сам зробить UseManualFix + ThemeTick
+                } else if (g_locBusy) {
+                    ++g_locGen;                    // відповідь, що летить, уже неактуальна
+                    g_locAgain = true;
+                } else {
+                    StartLocate();
+                }
+                ThemeTick();
+                UpdateThemeStatus();
+            }
+            return 0;
+        case IDC_TH_LAT:
+        case IDC_TH_LON:
+            if (HIWORD(wp) == EN_KILLFOCUS) CommitManualCoords();
+            return 0;
         case IDM_SETTINGS:
             ShowSettings(hwnd);
             return 0;
@@ -1472,6 +2204,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CLOSE:
         CommitAdvanced();          // підхопити те, що набрали й не зняли фокус
+        CommitManualCoords();      // CAPS-7: те саме для координат
         ShowWindow(hwnd, SW_HIDE); // закриття вікна не завершує програму
         return 0;
 
@@ -1512,11 +2245,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
 
     INITCOMMONCONTROLSEX icc = { sizeof(icc),
-                                 ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES };
+                                 ICC_STANDARD_CLASSES | ICC_TAB_CLASSES | ICC_BAR_CLASSES |
+                                 ICC_DATE_CLASSES | ICC_LINK_CLASS };   // CAPS-7: time picker, SysLink
     InitCommonControlsEx(&icc);
 
     InitializeCriticalSection(&g_magLock);
     LoadCursorSettings();
+    LoadThemeSettings();   // CAPS-7
     // Якщо попередній запуск обірвався із збільшеним курсором — повертаємо розмір
     // ДО того, як щось показуємо користувачу.
     RecoverCursorSize();
@@ -1574,10 +2309,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     SendMessageW(g_tabs, TCM_INSERTITEMW, 0, (LPARAM)&tab);
     tab.pszText = (LPWSTR)L"Курсор";
     SendMessageW(g_tabs, TCM_INSERTITEMW, 1, (LPARAM)&tab);
+    tab.pszText = (LPWSTR)L"День/ніч";
+    SendMessageW(g_tabs, TCM_INSERTITEMW, 2, (LPARAM)&tab);
 
     auto addL = [&](HWND c) { g_pageLayout[g_pageLayoutN++] = c; return c; };
     auto addC = [&](HWND c) { g_pageCursor[g_pageCursorN++] = c; return c; };
     auto addA = [&](HWND c) { g_advCtrls[g_advN++] = c; return c; };
+    auto addT = [&](HWND c) { g_pageTheme[g_pageThemeN++] = c; return c; };
+    auto addTA = [&](HWND c) { g_thAdv[g_thAdvN++] = c; return c; };
 
     // ---- вкладка «Розкладка» ----
     addL(mk(L"STATIC", L"CapsLock — перемкнути розкладку", 0, 28, 52, 300, 20, 0));
@@ -1654,7 +2393,66 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
 
     SetCursorValueLabels();
 
-    mk(L"STATIC", L"© Plum, 2026", 0, 20, 464, 200, 18, IDC_COPYRIGHT);
+    // ---- вкладка «День/ніч» (CAPS-7) ----
+    g_thEnable = addT(mk(L"BUTTON", L"Автоматично перемикати світлу і темну тему Windows",
+                         BS_AUTOCHECKBOX | WS_TABSTOP, 28, 52, 410, 24, IDC_TH_ENABLE));
+    SendMessageW(g_thEnable, BM_SETCHECK, g_th.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_thBySun = addT(mk(L"BUTTON", L"За сходом і заходом сонця",
+                        BS_AUTORADIOBUTTON | WS_GROUP | WS_TABSTOP, 28, 84, 220, 22, IDC_TH_BY_SUN));
+    g_thBySched = addT(mk(L"BUTTON", L"За розкладом", BS_AUTORADIOBUTTON,
+                          262, 84, 176, 22, IDC_TH_BY_SCHED));
+    CheckRadioButton(hwnd, IDC_TH_BY_SUN, IDC_TH_BY_SCHED,
+                     g_th.bySchedule ? IDC_TH_BY_SCHED : IDC_TH_BY_SUN);
+    g_thStatus = addT(mk(L"STATIC", L"", 0, 28, 112, 410, 36, IDC_TH_STATUS));
+
+    addT(mk(L"STATIC", L"Темна тема з", 0, 28, 158, 110, 20, 0));
+    g_thDarkFrom = addT(mk(DATETIMEPICK_CLASSW, L"", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP,
+                           140, 155, 90, 24, IDC_TH_DARK_FROM));
+    addT(mk(L"STATIC", L"світла з", 0, 262, 158, 74, 20, 0));
+    g_thLightFrom = addT(mk(DATETIMEPICK_CLASSW, L"", DTS_TIMEFORMAT | DTS_UPDOWN | WS_TABSTOP,
+                            348, 155, 90, 24, IDC_TH_LIGHT_FROM));
+    SetPickerMinutes(g_thDarkFrom,  g_th.darkFrom);
+    SetPickerMinutes(g_thLightFrom, g_th.lightFrom);
+
+    g_thToggle = addT(mk(L"BUTTON", L"Переключити зараз", BS_PUSHBUTTON | WS_TABSTOP,
+                         28, 196, 170, 26, IDC_TH_TOGGLE));
+    g_thNow = addT(mk(L"STATIC", L"", 0, 28, 230, 410, 36, IDC_TH_NOW));
+    addT(mk(L"STATIC", L"Поки відкрита повноекранна програма, тема не змінюється — "
+                       L"перемкнеться після її закриття.", 0, 28, 268, 410, 34, IDC_HINT_GRAY));
+    g_thAdvBtn = addT(mk(L"BUTTON", L"Детально ▾", BS_PUSHBUTTON | WS_TABSTOP,
+                         28, 310, 130, 26, IDC_TH_ADVANCED));
+
+    // «Детально»: звідки брати розташування для сходу/заходу
+    addTA(mk(L"STATIC", L"Розташування для сходу/заходу:", 0, 28, 346, 410, 18, 0));
+    {
+        const wchar_t* names[5] = { L"Автоматично", L"Служба Windows", L"За IP-адресою",
+                                    L"Вручну", L"Часовий пояс і регіон" };
+        const int xs[5] = { 28, 150, 290, 28, 150 };
+        const int ys[5] = { 366, 366, 366, 388, 388 };
+        const int ws[5] = { 116, 134, 148, 116, 210 };
+        for (int i = 0; i < 5; ++i)
+            g_thSrc[i] = addTA(mk(L"BUTTON", names[i],
+                BS_AUTORADIOBUTTON | (i == 0 ? (WS_GROUP | WS_TABSTOP) : 0),
+                xs[i], ys[i], ws[i], 20, IDC_TH_SRC_AUTO + i));
+        CheckRadioButton(hwnd, IDC_TH_SRC_AUTO, IDC_TH_SRC_TZ, IDC_TH_SRC_AUTO + (int)g_th.src);
+    }
+    addTA(mk(L"STATIC", L"Широта", 0, 28, 416, 60, 18, 0));
+    g_thLat = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 92, 413, 90, 22, IDC_TH_LAT));
+    addTA(mk(L"STATIC", L"Довгота", 0, 200, 416, 64, 18, 0));
+    g_thLon = addTA(mk(L"EDIT", L"", ES_RIGHT | WS_BORDER | WS_TABSTOP, 268, 413, 90, 22, IDC_TH_LON));
+    if (g_th.hasManual) {
+        wchar_t b[32];
+        swprintf(b, 32, L"%.4f", g_th.lat); SetWindowTextW(g_thLat, b);
+        swprintf(b, 32, L"%.4f", g_th.lon); SetWindowTextW(g_thLon, b);
+    }
+
+    // Підвал: © + версія з VERSIONINFO + посилання (CAPS-7)
+    {
+        wchar_t ver[32] = {}, about[192] = {};
+        ExeVersionString(ver, 32);
+        swprintf(about, 192, L"© Plum, 2026 · v%s · <a href=\"https://github.com/V-Plum/capslang\">GitHub</a>", ver);
+        mk(L"SysLink", about, 0, 20, 464, 300, 18, IDC_COPYRIGHT);   // WC_LINK
+    }
 
     // Логотип — поза вкладками, інакше його перекриє полотно таб-контрола
     SetRect(&g_logoRect, sc(398), sc(456), sc(398 + 48), sc(456 + 48));
@@ -1673,6 +2471,17 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int)
     Shell_NotifyIconW(NIM_ADD, &g_nid);
 
     g_mainWnd = hwnd;
+
+    // CAPS-7: одразу привести тему до часу доби; координати — з кешу, свіжі у фоні.
+    EnableThemeControls();
+    if (g_th.enabled) {
+        SetTimer(hwnd, TIMER_THEME, 60 * 1000, nullptr);
+        if (!g_th.bySchedule && (!g_fix.ok || NowUnix() - g_fix.at > 6 * 3600))
+            StartLocate();
+        ThemeTick();
+    } else {
+        UpdateThemeStatus();
+    }
 
     // CAPS-1: стежимо за зміною активного вікна, щоб знати, коли ми в remote/VM.
     g_inRemote = IsRemoteWindow(GetForegroundWindow());
